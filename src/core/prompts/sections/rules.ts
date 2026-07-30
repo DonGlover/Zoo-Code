@@ -79,5 +79,6 @@ RULES
 - Wait for user confirmation after each tool use before proceeding.
 - MCP operations: use one at a time, wait for success before proceeding.
 - Use ask_followup_question only when necessary; provide 2-4 suggested answers.
+- If no appropriate tool exists for completing the task, use ask_followup_question to clarify what you need from the user.
 - Do not end attempt_completion with questions or requests for further work.${settings?.isStealthModel ? getVendorConfidentialitySection() : ""}`
 }
