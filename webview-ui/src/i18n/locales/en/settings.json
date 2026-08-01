@@ -733,6 +733,10 @@
 			"unlimitedDescription": "Unlimited retries enabled (auto-proceed). The dialog will never appear.",
 			"warning": "⚠️ Setting to 0 allows unlimited retries which may consume significant API usage"
 		},
+		"modelContextWindow": {
+			"label": "Context Window Override",
+			"description": "Overrides the model's advertised context window. Use this if your actual deployment has a smaller limit (e.g., a quantized local model, constrained API tier, or reduced Ollama num_ctx). Leave empty to use the model's default."
+		},
 		"reasoningEffort": {
 			"label": "Model Reasoning Effort",
 			"none": "None",

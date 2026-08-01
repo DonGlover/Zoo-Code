@@ -17,6 +17,7 @@ export const baseProviderSettingsShape = {
 	reasoningEffort: reasoningEffortSettingSchema.optional(),
 	modelMaxTokens: z.number().optional(),
 	modelMaxThinkingTokens: z.number().optional(),
+	modelContextWindow: z.number().int().positive().optional(),
 	verbosity: verbosityLevelsSchema.optional(),
 }
 

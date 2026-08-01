@@ -115,10 +115,16 @@ export const useSelectedModel = (apiConfiguration?: ProviderSettings) => {
 					}
 				: { id: getProviderDefaultModelId(activeProvider ?? providerIdentifiers.openrouter), info: undefined }
 
+	// Apply context window override if configured
+	const overriddenInfo =
+		info && apiConfiguration?.modelContextWindow && apiConfiguration.modelContextWindow > 0
+			? { ...info, contextWindow: apiConfiguration.modelContextWindow }
+			: info
+
 	return {
 		provider,
 		id,
-		info,
+		info: overriddenInfo,
 		isLoading:
 			(needRouterModels && routerModels.isLoading) ||
 			(needOpenRouterProviders && openRouterModelProviders.isLoading) ||

@@ -11,6 +11,7 @@ import {
 
 import { getRouterRemovalMessage } from "../core/config/routerRemoval"
 import { ApiStream } from "./transform/stream"
+import { ContextWindowOverrideHandler } from "./context-window-override-handler"
 
 import {
 	AnthropicHandler,
@@ -42,7 +43,6 @@ import {
 	VercelAiGatewayHandler,
 	OpencodeGoHandler,
 	KenariHandler,
-	NanoGptHandler,
 	ZooGatewayHandler,
 	MiniMaxHandler,
 	MimoHandler,
@@ -164,78 +164,85 @@ export function buildApiHandler(configuration: ProviderSettings): ApiHandler {
 		)
 	}
 
-	switch (apiProvider) {
-		case providerIdentifiers.anthropic:
-			return new AnthropicHandler(options)
-		case providerIdentifiers.openrouter:
-			return new OpenRouterHandler(options)
-		case providerIdentifiers.bedrock:
-			return new AwsBedrockHandler(options)
-		case providerIdentifiers.vertex:
-			return options.apiModelId?.startsWith("claude")
-				? new AnthropicVertexHandler(options)
-				: new VertexHandler(options)
-		case providerIdentifiers.openai:
-			return new OpenAiHandler(options)
-		case providerIdentifiers.ollama:
-			return new NativeOllamaHandler(options)
-		case providerIdentifiers.lmstudio:
-			return new LmStudioHandler(options)
-		case providerIdentifiers.gemini:
-			return new GeminiHandler(options)
-		case providerIdentifiers.openaiCodex:
-			return new OpenAiCodexHandler(options)
-		case providerIdentifiers.openaiNative:
-			return new OpenAiNativeHandler(options)
-		case providerIdentifiers.deepseek:
-			return new DeepSeekHandler(options)
-		case providerIdentifiers.qwenCode:
-			return new QwenCodeHandler(options)
-		case providerIdentifiers.moonshot:
-			return new MoonshotHandler(options)
-		case providerIdentifiers.kimiCode:
-			return new KimiCodeHandler(options)
-		case providerIdentifiers.vscodeLm:
-			return new VsCodeLmHandler(options)
-		case providerIdentifiers.mistral:
-			return new MistralHandler(options)
-		case providerIdentifiers.requesty:
-			return new RequestyHandler(options)
-		case providerIdentifiers.unbound:
-			return new UnboundHandler(options)
-		case providerIdentifiers.fakeAi:
-			return new FakeAIHandler(options)
-		case providerIdentifiers.xai:
-			return new XAIHandler(options)
-		case providerIdentifiers.litellm:
-			return new LiteLLMHandler(options)
-		case providerIdentifiers.sambanova:
-			return new SambaNovaHandler(options)
-		case providerIdentifiers.mimo:
-			return new MimoHandler(options)
-		case providerIdentifiers.zai:
-			return new ZAiHandler(options)
-		case providerIdentifiers.fireworks:
-			return new FireworksHandler(options)
-		case providerIdentifiers.friendli:
-			return new FriendliHandler(options)
-		case providerIdentifiers.vercelAiGateway:
-			return new VercelAiGatewayHandler(options)
-		case providerIdentifiers.opencodeGo:
-			return new OpencodeGoHandler(options)
-		case providerIdentifiers.kenari:
-			return new KenariHandler(options)
-		case providerIdentifiers.nanogpt:
-			return new NanoGptHandler(options)
-		case providerIdentifiers.zooGateway:
-			return new ZooGatewayHandler(options)
-		case providerIdentifiers.minimax:
-			return new MiniMaxHandler(options)
-		case providerIdentifiers.baseten:
-			return new BasetenHandler(options)
-		case providerIdentifiers.poe:
-			return new PoeHandler(options)
-		default:
-			return new AnthropicHandler(options)
+	const handler = (() => {
+		switch (apiProvider) {
+			case providerIdentifiers.anthropic:
+				return new AnthropicHandler(options)
+			case providerIdentifiers.openrouter:
+				return new OpenRouterHandler(options)
+			case providerIdentifiers.bedrock:
+				return new AwsBedrockHandler(options)
+			case providerIdentifiers.vertex:
+				return options.apiModelId?.startsWith("claude")
+					? new AnthropicVertexHandler(options)
+					: new VertexHandler(options)
+			case providerIdentifiers.openai:
+				return new OpenAiHandler(options)
+			case providerIdentifiers.ollama:
+				return new NativeOllamaHandler(options)
+			case providerIdentifiers.lmstudio:
+				return new LmStudioHandler(options)
+			case providerIdentifiers.gemini:
+				return new GeminiHandler(options)
+			case providerIdentifiers.openaiCodex:
+				return new OpenAiCodexHandler(options)
+			case providerIdentifiers.openaiNative:
+				return new OpenAiNativeHandler(options)
+			case providerIdentifiers.deepseek:
+				return new DeepSeekHandler(options)
+			case providerIdentifiers.qwenCode:
+				return new QwenCodeHandler(options)
+			case providerIdentifiers.moonshot:
+				return new MoonshotHandler(options)
+			case providerIdentifiers.kimiCode:
+				return new KimiCodeHandler(options)
+			case providerIdentifiers.vscodeLm:
+				return new VsCodeLmHandler(options)
+			case providerIdentifiers.mistral:
+				return new MistralHandler(options)
+			case providerIdentifiers.requesty:
+				return new RequestyHandler(options)
+			case providerIdentifiers.unbound:
+				return new UnboundHandler(options)
+			case providerIdentifiers.fakeAi:
+				return new FakeAIHandler(options)
+			case providerIdentifiers.xai:
+				return new XAIHandler(options)
+			case providerIdentifiers.litellm:
+				return new LiteLLMHandler(options)
+			case providerIdentifiers.sambanova:
+				return new SambaNovaHandler(options)
+			case providerIdentifiers.mimo:
+				return new MimoHandler(options)
+			case providerIdentifiers.zai:
+				return new ZAiHandler(options)
+			case providerIdentifiers.fireworks:
+				return new FireworksHandler(options)
+			case providerIdentifiers.friendli:
+				return new FriendliHandler(options)
+			case providerIdentifiers.vercelAiGateway:
+				return new VercelAiGatewayHandler(options)
+			case providerIdentifiers.opencodeGo:
+				return new OpencodeGoHandler(options)
+			case providerIdentifiers.kenari:
+				return new KenariHandler(options)
+			case providerIdentifiers.zooGateway:
+				return new ZooGatewayHandler(options)
+			case providerIdentifiers.minimax:
+				return new MiniMaxHandler(options)
+			case providerIdentifiers.baseten:
+				return new BasetenHandler(options)
+			case providerIdentifiers.poe:
+				return new PoeHandler(options)
+			default:
+				return new AnthropicHandler(options)
+		}
+	})()
+
+	// Apply context window override if configured
+	if (configuration.modelContextWindow && configuration.modelContextWindow > 0) {
+		return new ContextWindowOverrideHandler(handler, configuration.modelContextWindow)
 	}
+
+	return handler
 }
