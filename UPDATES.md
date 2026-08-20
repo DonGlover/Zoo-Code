@@ -45,11 +45,43 @@
 - [ ] Usability polish for non-coding workflows
 - [ ] Model selection as priority UX improvement
 
-### Testing & Verification
+### Testing & Polish (Before Upstreaming)
 
-- [ ] Unit tests for context-window-override-handler
-- [ ] Integration test: verify override flows through to Task.ts condensation logic
-- [ ] Test with constrained context (e.g., 4k override on 128k model) to verify early condensation
+**Goal:** Ensure feature is solid, well-integrated, and doesn't appear grafted on.
+
+#### Testing
+
+- [ ] Unit tests for context-window-override-handler (foundation)
+- [ ] Integration tests: verify override flows through to Task.ts condensation logic
+- [ ] Edge case testing:
+    - [ ] 4k override on 128k model (verify early condensation triggers)
+    - [ ] Override value of 0 (should be ignored)
+    - [ ] Negative values (should be rejected)
+    - [ ] Override larger than model's actual max (should clamp or warn)
+- [ ] Test across provider types:
+    - [ ] Static models (Anthropic, Bedrock, etc.)
+    - [ ] Dynamic providers (OpenRouter, LiteLLM, etc.)
+    - [ ] Local providers (Ollama, LM Studio)
+    - [ ] Router providers (zoo-gateway, kimi-code) — auth-scoped providers
+    - [ ] Different model families (Claude, Qwen, Gemma, etc.)
+- [ ] Router provider metadata interaction (from Zoo Code PR #1053):
+    - [ ] Override applies correctly before ensureModelFetched() (hardcoded defaults)
+    - [ ] Override still applies after ensureModelFetched() (real metadata)
+    - [ ] No stale metadata issues across multiple requests
+    - [ ] Verify ContextWindowOverrideHandler doesn't conflict with RouterProvider's ensureModelFetched()
+
+#### Polish & Integration
+
+- [ ] UI error handling (invalid input, out-of-range values)
+- [ ] Help text clarity (what "override" means, when to use it)
+- [ ] Visual feedback (highlight active override in UI)
+- [ ] Code consistency (follows Zoo Code patterns, no obvious seams)
+- [ ] Documentation:
+    - [ ] Inline code comments explaining the design
+    - [ ] README or guide on when/why to use the override
+    - [ ] Commit message captures design decisions
+- [ ] Performance check (no noticeable lag when setting/changing override)
+- [ ] Backward compatibility (works with existing saved settings)
 
 ### Token Efficiency (Ongoing)
 
