@@ -1,6 +1,7 @@
+import type { Anthropic } from "@anthropic-ai/sdk"
+
 import type { ApiHandler, ApiHandlerCreateMessageMetadata } from "./index"
 import type { ApiStream } from "./transform/stream"
-import type Anthropic from "openai"
 
 /**
  * Wraps any ApiHandler to override its getModel().info.contextWindow with a user-supplied value.

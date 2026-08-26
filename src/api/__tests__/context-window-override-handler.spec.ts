@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest"
+import type { Anthropic } from "@anthropic-ai/sdk"
+
 import { ContextWindowOverrideHandler } from "../context-window-override-handler"
 import type { ApiHandler, ApiHandlerCreateMessageMetadata } from "../index"
 import type { ApiStream } from "../transform/stream"
-import type Anthropic from "openai"
 
 describe("ContextWindowOverrideHandler", () => {
 	let mockInnerHandler: ApiHandler
@@ -43,8 +44,7 @@ describe("ContextWindowOverrideHandler", () => {
 		const systemPrompt = "test prompt"
 		const messages: Anthropic.Messages.MessageParam[] = []
 		const metadata: ApiHandlerCreateMessageMetadata = {
-			budget: {},
-			customInstructions: {},
+			taskId: "test-task-id",
 		}
 
 		overrideHandler.createMessage(systemPrompt, messages, metadata)
@@ -60,13 +60,10 @@ describe("ContextWindowOverrideHandler", () => {
 		expect(result).toBe(100)
 	})
 
-	it("should handle undefined modelInfo gracefully", () => {
-		mockInnerHandler.getModel = vi.fn(() => ({
-			id: "test-model",
-			info: undefined,
-		}))
-
+	it("should preserve other modelInfo properties when overriding", () => {
 		const result = overrideHandler.getModel()
-		expect(result.info).toBeUndefined()
+		expect(result.id).toBe("test-model")
+		expect(result.info?.supportsPromptCache).toBe(true)
+		expect(result.info?.contextWindow).toBe(8000) // Overridden
 	})
 })
