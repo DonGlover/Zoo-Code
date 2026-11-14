@@ -31,7 +31,7 @@ export const ModelContextWindowControl = ({ value, onChange, modelDefault }: Mod
 					type="text"
 					onInput={(e) => handleInputChange((e.target as HTMLInputElement).value)}
 					placeholder={
-						modelDefault ? `Default: ${formatLargeNumber(modelDefault)}` : "Enter context window size"
+						modelDefault ? `Default: ${formatLargeNumber(modelDefault, t)}` : "Enter context window size"
 					}
 					style={{
 						flex: 1,
@@ -43,7 +43,7 @@ export const ModelContextWindowControl = ({ value, onChange, modelDefault }: Mod
 						})(),
 					}}
 				/>
-				{value && <span className="text-sm text-vscode-descriptionForeground">{formatLargeNumber(value)}</span>}
+				{value && <span className="text-sm text-vscode-descriptionForeground">{formatLargeNumber(value, t)}</span>}
 			</div>
 			<div className="text-sm text-vscode-descriptionForeground">
 				{t("settings:providers.modelContextWindow.description")}

@@ -1,6 +1,6 @@
 import type { Anthropic } from "@anthropic-ai/sdk"
 
-import type { ApiHandler, ApiHandlerCreateMessageMetadata } from "./index"
+import type { ApiHandler, ApiHandlerCreateMessageMetadata, ModelCacheScope } from "./index"
 import type { ApiStream } from "./transform/stream"
 
 /**
@@ -37,5 +37,9 @@ export class ContextWindowOverrideHandler implements ApiHandler {
 
 	countTokens(content: Array<Anthropic.Messages.ContentBlockParam>) {
 		return this.inner.countTokens(content)
+	}
+
+	getModelCacheScope(): ModelCacheScope {
+		return this.inner.getModelCacheScope()
 	}
 }

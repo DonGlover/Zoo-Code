@@ -47,13 +47,11 @@ Zoo Code parte dalle fondamenta create da Roo Code e continua ad ampliarle con:
 - **Workflow di terminale e modifica più affidabili** — correzioni per il completamento prematuro del terminale, le race condition dello stato delle attività, la gestione del contesto, la modifica dei diff e l'uso di strumenti specifici dei provider.
 - **Più controllo sul tuo workspace** — gestione delle regole, restrizioni MCP per modalità, controlli dei percorsi multi-root, opzioni di reasoning dei modelli e azioni per esaminare le modifiche al completamento.
 
-## Novità in v3.78.0
+## Novità in v3.96.0
 
-- **Sono arrivati tre importanti nuovi modelli** — usa i nuovissimi Gemini 3.7 Flash, GLM 5.3 e Qwen3.8 Max, oltre agli aggiornamenti di reasoning, prezzi e copertura dei provider per DeepSeek V4.
-- **Connettiti a NanoGPT** — usa la scoperta dinamica dei modelli, streaming e completamenti dei prompt, con preferenze di routing per velocità, prezzo, latenza, throughput, supporto agli strumenti e caching.
-- **Provider e task più affidabili** — le correzioni migliorano la configurazione degli endpoint Azure OpenAI, i limiti di output di Kimi Code, la conservazione dei titoli nella cronologia dei task e l'importazione/esportazione delle impostazioni Zoo.
-- Destructive Command Guard ora supporta i Mac basati su Intel.
-- Gli aggiornamenti di sicurezza risolvono vulnerabilità in `undici` e Mermaid.
+- ✨ **Nuove impostazioni della chat e diagnostica:** Mostra i timestamp dei messaggi con formati di data e ora configurabili, regola il TTL della prompt-cache per i profili Anthropic e genera report diagnostici rispettosi della privacy.
+- 💸 **Costi dei provider e caching più precisi:** Mantiene intatti i risultati dei tool Anthropic, adotta i token di output cumulativi nei costi Anthropic e MiniMax, legge i contatori della prompt-cache di DeepSeek, punta alla cache Responses di xAI e fattura le letture della cache di Mistral a 0,1x.
+- 🧭 **Chat più affidabili e veloci:** Riprendi le attività completate dopo un riavvio, ripristina i checkpoint quando manca il commit salvato, ricarica automaticamente un renderer webview morto, limita gli aggiornamenti in streaming e carica le lingue su richiesta.
 
 ## Cosa può fare Zoo Code per TE?
 

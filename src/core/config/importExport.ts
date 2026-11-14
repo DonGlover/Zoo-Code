@@ -10,6 +10,7 @@ import {
 	globalSettingsSchema,
 	providerSettingsWithIdSchema,
 	isProviderName,
+	retiredProviderIdentifiers,
 	type GlobalSettings,
 	type ProviderSettingsWithId,
 } from "@roo-code/types"
@@ -61,7 +62,7 @@ function sanitizeProviderConfig(configName: string, apiConfig: unknown): { confi
 	if (config.apiProvider !== undefined && !isProviderName(config.apiProvider)) {
 		const invalidProvider = config.apiProvider
 		// Return a new config object without the invalid apiProvider
-		const { apiProvider, ...restConfig } = config
+		const { apiProvider: _apiProvider, ...restConfig } = config
 		return {
 			config: restConfig,
 			warning: `Profile "${configName}": Invalid provider "${invalidProvider}" was removed. Please reconfigure this profile.`,
@@ -106,7 +107,7 @@ function sanitizeGlobalSettings(rawGlobalSettings: unknown): {
 
 		let valueToValidate = rawValue
 
-		if (key === "imageGenerationProvider" && rawValue === "roo") {
+		if (key === "imageGenerationProvider" && rawValue === retiredProviderIdentifiers.roo) {
 			warnings.push(`Setting "${path}" used unsupported value "roo" and was cleared during import.`)
 			valueToValidate = undefined
 		}
@@ -232,16 +233,16 @@ export async function importSettingsFromPath(
 		// Set the current provider.
 		const currentProviderName = providerProfiles.currentApiConfigName
 		const currentProvider = providerProfiles.apiConfigs[currentProviderName]
-		contextProxy.setValue("currentApiConfigName", currentProviderName)
+		await contextProxy.setValue("currentApiConfigName", currentProviderName)
 
 		// TODO: It seems like we don't need to have the provider settings in
 		// the proxy; we can just use providerSettingsManager as the source of
 		// truth.
 		if (currentProvider) {
-			contextProxy.setProviderSettings(currentProvider)
+			await contextProxy.setProviderSettings(currentProvider)
 		}
 
-		contextProxy.setValue("listApiConfigMeta", await providerSettingsManager.listConfig())
+		await contextProxy.setValue("listApiConfigMeta", await providerSettingsManager.listConfig())
 
 		return {
 			providerProfiles,
@@ -294,6 +295,8 @@ export const importSettings = async ({ providerSettingsManager, contextProxy, cu
 
 /**
  * Import settings from a specific file
+ *
+ * @internal
  * @param options - Import options containing managers and proxy
  * @param fileUri - URI of the file to import from
  * @returns Promise resolving to import result

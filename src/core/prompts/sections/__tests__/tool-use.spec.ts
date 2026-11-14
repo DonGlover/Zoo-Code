@@ -5,14 +5,18 @@ describe("getSharedToolUseSection", () => {
 		const section = getSharedToolUseSection()
 
 		expect(section).toContain("provider-native tool-calling mechanism")
-		expect(section).toContain("Do not include XML markup or examples")
 	})
 
 	it("should include multiple tools per message guidance", () => {
 		const section = getSharedToolUseSection()
 
-		expect(section).toContain("You must call at least one tool per assistant response")
 		expect(section).toContain("Prefer calling as many tools as are reasonably needed")
+		expect(section).not.toContain("You must call at least one tool per assistant response")
+	})
+
+	it("should require at least one tool per response in code and architect modes", () => {
+		expect(getSharedToolUseSection("code")).toContain("You must call at least one tool per assistant response")
+		expect(getSharedToolUseSection("architect")).toContain("You must call at least one tool per assistant response")
 	})
 
 	it("should NOT include single tool per message restriction", () => {

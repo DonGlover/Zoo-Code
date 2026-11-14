@@ -11,8 +11,8 @@ import {
 	type GlobalState,
 	type ClineMessage,
 	type TelemetrySetting,
-	type UserSettingsConfig,
 	type ModelRecord,
+	type ProviderSettings,
 	type Command as SlashCommand,
 	type WebviewMessage,
 	type EditQueuedMessagePayload,
@@ -23,11 +23,13 @@ import {
 	checkoutRestorePayloadSchema,
 	getCompletionCheckpoint,
 	providerIdentifiers,
+	retiredProviderIdentifiers,
 	LmStudioModelsMessageType,
 	OllamaModelsMessageType,
 	OpenAiModelsMessageType,
 	RouterModelsMessageType,
 	VsCodeLmModelsMessageType,
+	isTelemetryOptedIn,
 } from "@roo-code/types"
 import { customToolRegistry } from "@roo-code/core"
 import { CloudService } from "@roo-code/cloud"
@@ -35,10 +37,13 @@ import { TelemetryService } from "@roo-code/telemetry"
 
 import { type ApiMessage } from "../task-persistence/apiMessages"
 import { saveTaskMessages } from "../task-persistence"
+import { isInvalidDisplayValue } from "../config/displaySettings"
 import { importRooTaskHistory } from "../task-persistence/importRooTaskHistory"
 
 import { ClineProvider } from "./ClineProvider"
+import { findOriginalContent } from "./stripOriginalContent"
 import { handleCheckpointRestoreOperation } from "./checkpointRestoreHandler"
+import { assertRecordedCheckpoint } from "../checkpoints/recordedCheckpoint"
 import { generateErrorDiagnostics } from "./diagnosticsHandler"
 import {
 	handleRequestSkills,
@@ -60,7 +65,7 @@ import { Package } from "../../shared/package"
 import { type RouterName, toRouterName } from "../../shared/api"
 import { MessageEnhancer } from "./messageEnhancer"
 
-import { CodeIndexManager } from "../../services/code-index/manager"
+import { CodeIndexManagerRegistry } from "../../services/code-index/code-index-manager-registry"
 import { checkExistKey } from "../../shared/checkExistApiConfig"
 import { getRouterRemovalMessage, getRouterUnavailableSignInMessage } from "../config/routerRemoval"
 import { experimentDefault } from "../../shared/experiments"
@@ -77,12 +82,20 @@ import { searchCommits } from "../../utils/git"
 import { exportSettings, importSettingsWithFeedback } from "../config/importExport"
 import { getOpenAiModels } from "../../api/providers/openai"
 import { getVsCodeLmModels } from "../../api/providers/vscode-lm"
+import { getGitHubCopilotViewState } from "../../services/language-models/copilotViewState"
+import {
+	connectGitHubCopilot,
+	getGitHubCopilotAccount,
+	getGitHubCopilotModels,
+	openGitHubAccountManagement,
+} from "../../api/providers/github-copilot"
 import { openMention } from "../mentions"
 import { resolveImageMentions } from "../mentions/resolveImageMentions"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
 import { getWorkspacePath } from "../../utils/path"
-import { isPathOutsideWorkspace } from "../../utils/pathUtils"
+import { isPathOutsideWorkspace, decodeUntrustedPathToStable, isRealPathOutsideWorkspace } from "../../utils/pathUtils"
 import { Mode, defaultModeSlug } from "../../shared/modes"
+import { buildApiHandler, type ApiHandler } from "../../api"
 import { getModels, flushModels } from "../../api/providers/fetchers/modelCache"
 import { GetModelsOptions } from "../../shared/api"
 import { generateSystemPrompt } from "./generateSystemPrompt"
@@ -91,6 +104,15 @@ import { getCommand } from "../../utils/commands"
 import { getLMStudioModels } from "../../api/providers/fetchers/lmstudio"
 
 const ALLOWED_VSCODE_SETTINGS = new Set(["terminal.integrated.inheritEnv"])
+
+// Serializes handling of "telemetrySetting" messages. Each invocation reads the previous
+// setting, awaits a persistence write, then applies the new live telemetry state -- with no
+// serialization, two rapid messages (e.g. a fast toggle) can interleave across those awaits:
+// each invocation captures its own isOptedIn in a closure, so whichever invocation's tail end
+// (TelemetryService.instance.updateTelemetryState) happens to resolve *last* wins, regardless
+// of which message the user sent last. Chaining onto this promise ensures a given invocation's
+// entire read-write-apply sequence completes before the next one starts.
+let telemetrySettingQueue: Promise<void> = Promise.resolve()
 
 import { MarketplaceManager, MarketplaceItemType } from "../../services/marketplace"
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
@@ -106,6 +128,9 @@ import {
 	handleCreateWorktreeInclude,
 	handleCheckoutBranch,
 } from "./worktree"
+
+const handlerFor = (apiConfiguration: ProviderSettings, provider: RouterName): ApiHandler =>
+	buildApiHandler({ ...apiConfiguration, apiProvider: provider })
 
 export const webviewMessageHandler = async (
 	provider: ClineProvider,
@@ -563,6 +588,11 @@ export const webviewMessageHandler = async (
 	}
 
 	switch (message.type) {
+		case "themeFixtureProbeResponse":
+			if (process.env.ROO_CODE_THEME_FIXTURE_PROBE === "1" && message.requestId && message.themeFixture) {
+				provider.resolveWebviewThemeFixtureProbe(message.requestId, message.themeFixture)
+			}
+			break
 		case "webviewDidLaunch":
 			// Load custom modes first
 			const customModes = await provider.customModesManager.getCustomModes()
@@ -638,14 +668,43 @@ export const webviewMessageHandler = async (
 					),
 				)
 
-			// Enable telemetry by default (when unset) or when explicitly enabled
-			await provider.getStateToPostToWebview().then((state) => {
-				const { telemetrySetting } = state
-				const isOptedIn = telemetrySetting !== "disabled"
-				TelemetryService.instance.updateTelemetryState(isOptedIn)
-			})
+			// Telemetry is on by disclosed default: "unset" (no choice made yet) leaves that
+			// default in effect, same as "enabled". Only an explicit "disabled" opts out.
+			// vscode.env.isTelemetryEnabled is ANDed in (matching extension.ts's
+			// onDidChangeTelemetryEnabled listener) so a webview reload can't re-enable
+			// telemetry while VS Code's global toggle is off.
+			//
+			// Read the setting synchronously via getGlobalState (same as the "telemetrySetting"
+			// handler below) rather than awaiting provider.getStateToPostToWebview() -- that
+			// async gap let this continuation resolve after a concurrent "telemetrySetting"
+			// message's queued update and clobber it with a stale value, the same interleaving
+			// class of bug telemetrySettingQueue exists to prevent. Routing through the queue
+			// here too means webviewDidLaunch can't race a concurrent telemetrySetting message
+			// either.
+			telemetrySettingQueue = telemetrySettingQueue
+				.catch(() => undefined)
+				.then(async () => {
+					if (!TelemetryService.hasInstance()) {
+						return
+					}
+
+					const telemetrySetting = getGlobalState("telemetrySetting") || "unset"
+					TelemetryService.instance.updateTelemetryState(
+						isTelemetryOptedIn(telemetrySetting) && vscode.env.isTelemetryEnabled,
+					)
+				})
+
+			await telemetrySettingQueue.catch((error) =>
+				provider.log(
+					`Error initializing telemetry state on launch: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			)
 
 			provider.isViewLaunched = true
+			break
+		case "webviewHeartbeat":
+			// Confirm renderer liveness and advance the watchdog recovery health window.
+			provider.updateWebviewHeartbeat()
 			break
 		case "newTask":
 			// Initializing new instance of Cline will make sure that any
@@ -684,8 +743,18 @@ export const webviewMessageHandler = async (
 			}
 			break
 
-		case "updateSettings":
-			if (message.updatedSettings) {
+		case "updateSettings": {
+			// The settings are written one at a time, in the order sent, and not as a transaction. If a write fails, the
+			// ones before it stay stored and the ones after it are not written. The display settings only change how
+			// times are shown, so a partial save is harmless, and saving again completes it. Either way the webview is
+			// refreshed and, if the request has an id, told whether the save was stored (`settingsSaveResult`): the
+			// settings page keeps the user's edits as unsaved after a failure. The error is then thrown, as it always was.
+			let failed = false
+			let failure: unknown
+
+			try {
+				if (!message.updatedSettings) break
+
 				if (message.updatedSettings.destructiveCommandGuardEnabled === true) {
 					try {
 						const { ensureDcgInstalled } = await import("../../services/destructive-command-guard")
@@ -705,6 +774,12 @@ export const webviewMessageHandler = async (
 				}
 
 				for (const [key, value] of Object.entries(message.updatedSettings)) {
+					// An invalid display value is ignored, before anything is done for it.
+					if (isInvalidDisplayValue(key, value)) {
+						provider.log(`[updateSettings] Ignored an invalid value for ${key}`)
+						continue
+					}
+
 					let newValue = value
 
 					if (key === "language") {
@@ -730,6 +805,17 @@ export const webviewMessageHandler = async (
 						await vscode.workspace
 							.getConfiguration(Package.name)
 							.update("deniedCommands", newValue, vscode.ConfigurationTarget.Global)
+					} else if (key === "allowedReadFiles" || key === "allowedWriteFiles") {
+						const patterns = value ?? []
+
+						// Blank lines, which the textarea editor produces freely,
+						// name no file and are dropped here. Patterns are
+						// otherwise not `.trim()`ed: leading whitespace is
+						// significant in gitignore syntax, and trailing
+						// whitespace has to be escaped by the user to be kept.
+						newValue = Array.isArray(patterns)
+							? patterns.filter((pattern) => typeof pattern === "string" && pattern.trim().length > 0)
+							: []
 					} else if (key === "ttsEnabled") {
 						newValue = value ?? true
 						setTtsEnabled(newValue as boolean)
@@ -805,11 +891,33 @@ export const webviewMessageHandler = async (
 
 					await provider.contextProxy.setValue(key as keyof RooCodeSettings, newValue)
 				}
-
-				await provider.postStateToWebview()
+			} catch (error) {
+				failed = true
+				failure = error
 			}
 
+			// A failed refresh must neither undo a stored save nor keep the webview from getting the result.
+			try {
+				await provider.postStateToWebview()
+			} catch (error) {
+				provider.log(
+					`[updateSettings] Could not refresh the webview state: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			}
+
+			if (message.requestId) {
+				await provider.postMessageToWebview({
+					type: "settingsSaveResult",
+					requestId: message.requestId,
+					success: !failed,
+					...(failed ? { error: failure instanceof Error ? failure.message : String(failure) } : {}),
+				})
+			}
+
+			if (failed) throw failure
+
 			break
+		}
 
 		case "terminalOperation":
 			if (message.terminalOperation) {
@@ -917,6 +1025,11 @@ export const webviewMessageHandler = async (
 		case "exportTaskWithId":
 			await provider.exportTaskWithId(message.text!)
 			break
+		case "renameTaskWithId":
+			if (message.taskId) {
+				await provider.renameTaskWithId(message.taskId, message.text)
+			}
+			break
 		case "getTaskWithAggregatedCosts": {
 			try {
 				const taskId = message.text
@@ -1002,7 +1115,6 @@ export const webviewMessageHandler = async (
 				// so a retry after a partial-copy failure still reconciles the store.
 				await provider.taskHistoryStore.invalidateAll()
 				await provider.taskHistoryStore.reconcile()
-				await provider.taskHistoryStore.flushIndex()
 				await provider.postStateToWebview()
 				await provider.postMessageToWebview({
 					type: "rooHistoryImportProgress",
@@ -1049,12 +1161,18 @@ export const webviewMessageHandler = async (
 		case "resetState":
 			await provider.resetState()
 			break
-		case RouterModelsMessageType.flushRouterModels:
+		case RouterModelsMessageType.flushRouterModels: {
+			const { apiConfiguration } = await provider.getState()
 			const routerNameFlush: RouterName = toRouterName(message.text)
 			// Note: flushRouterModels is a generic flush without credentials
 			// For providers that need credentials, use their specific handlers
-			await flushModels({ provider: routerNameFlush } as GetModelsOptions, true)
+			await flushModels(
+				{ provider: routerNameFlush } as GetModelsOptions,
+				handlerFor(apiConfiguration, routerNameFlush),
+				true,
+			)
 			break
+		}
 		case RouterModelsMessageType.requestRouterModels: {
 			const { apiConfiguration } = await provider.getState()
 
@@ -1081,13 +1199,15 @@ export const webviewMessageHandler = async (
 						[providerIdentifiers.moonshot]: {},
 						[providerIdentifiers.opencodeGo]: {},
 						[providerIdentifiers.kenari]: {},
+						[providerIdentifiers.ioIntelligence]: {},
 						[providerIdentifiers.nanogpt]: {},
 						[providerIdentifiers.kimiCode]: {},
+						[providerIdentifiers.friendli]: {},
 					}
 
-			const safeGetModels = async (options: GetModelsOptions): Promise<ModelRecord> => {
+			const safeGetModels = async (options: GetModelsOptions, handler: ApiHandler): Promise<ModelRecord> => {
 				try {
-					return await getModels(options)
+					return await getModels(options, handler)
 				} catch (error) {
 					console.error(
 						`Failed to fetch models in webviewMessageHandler requestRouterModels for ${options.provider}:`,
@@ -1145,6 +1265,7 @@ export const webviewMessageHandler = async (
 				if (message?.values?.litellmApiKey || message?.values?.litellmBaseUrl) {
 					await flushModels(
 						{ provider: providerIdentifiers.litellm, apiKey: litellmApiKey, baseUrl: litellmBaseUrl },
+						handlerFor(apiConfiguration, providerIdentifiers.litellm),
 						true,
 					)
 				}
@@ -1163,6 +1284,7 @@ export const webviewMessageHandler = async (
 				if (message?.values?.poeApiKey || message?.values?.poeBaseUrl) {
 					await flushModels(
 						{ provider: providerIdentifiers.poe, apiKey: poeApiKey, baseUrl: poeBaseUrl },
+						handlerFor(apiConfiguration, providerIdentifiers.poe),
 						true,
 					)
 				}
@@ -1181,6 +1303,7 @@ export const webviewMessageHandler = async (
 				if (message?.values?.deepSeekApiKey || message?.values?.deepSeekBaseUrl) {
 					await flushModels(
 						{ provider: providerIdentifiers.deepseek, apiKey: deepSeekApiKey, baseUrl: deepSeekBaseUrl },
+						handlerFor(apiConfiguration, providerIdentifiers.deepseek),
 						true,
 					)
 				}
@@ -1203,6 +1326,7 @@ export const webviewMessageHandler = async (
 				if (message?.values?.moonshotApiKey || message?.values?.moonshotBaseUrl) {
 					await flushModels(
 						{ provider: providerIdentifiers.moonshot, apiKey: moonshotApiKey, baseUrl: moonshotBaseUrl },
+						handlerFor(apiConfiguration, providerIdentifiers.moonshot),
 						true,
 					)
 				}
@@ -1226,7 +1350,11 @@ export const webviewMessageHandler = async (
 
 			// Refresh the cache when a new key is explicitly provided (e.g. the Refresh Models button).
 			if (message?.values?.opencodeGoApiKey) {
-				await flushModels({ provider: providerIdentifiers.opencodeGo, apiKey: opencodeGoApiKey }, true)
+				await flushModels(
+					{ provider: providerIdentifiers.opencodeGo, apiKey: opencodeGoApiKey },
+					handlerFor(apiConfiguration, providerIdentifiers.opencodeGo),
+					true,
+				)
 			}
 
 			candidates.push({
@@ -1243,7 +1371,11 @@ export const webviewMessageHandler = async (
 
 			// Refresh the cache when a new key is explicitly provided (e.g. the Refresh Models button).
 			if (message?.values?.kenariApiKey) {
-				await flushModels({ provider: providerIdentifiers.kenari, apiKey: kenariApiKey }, true)
+				await flushModels(
+					{ provider: providerIdentifiers.kenari, apiKey: kenariApiKey },
+					handlerFor(apiConfiguration, providerIdentifiers.kenari),
+					true,
+				)
 			}
 
 			candidates.push({
@@ -1251,18 +1383,41 @@ export const webviewMessageHandler = async (
 				options: { provider: providerIdentifiers.kenari, apiKey: kenariApiKey },
 			})
 
+			// IO Intelligence's /models catalog is public; an optional key can scope
+			// the visible model set. Prefer an explicitly supplied unsaved key.
+			const ioIntelligenceApiKey = message?.values?.ioIntelligenceApiKey ?? apiConfiguration.ioIntelligenceApiKey
+			if (message?.values?.ioIntelligenceApiKey !== undefined) {
+				await flushModels(
+					{ provider: providerIdentifiers.ioIntelligence, apiKey: ioIntelligenceApiKey },
+					handlerFor(apiConfiguration, providerIdentifiers.ioIntelligence),
+					true,
+				)
+			}
+
+			candidates.push({
+				key: providerIdentifiers.ioIntelligence,
+				options: { provider: providerIdentifiers.ioIntelligence, apiKey: ioIntelligenceApiKey },
+			})
+
 			// NanoGPT's detailed catalog is public, while an optional key can expose a
 			// different allowlist. Prefer an explicitly supplied unsaved key and use the
 			// same key-scoped options for refresh and retrieval.
 			const nanoGptApiKey = message?.values?.nanoGptApiKey ?? apiConfiguration.nanoGptApiKey
 			if (message?.values?.nanoGptApiKey !== undefined) {
-				await flushModels({ provider: providerIdentifiers.nanogpt, apiKey: nanoGptApiKey }, true)
+				await flushModels(
+					{ provider: providerIdentifiers.nanogpt, apiKey: nanoGptApiKey },
+					handlerFor(apiConfiguration, providerIdentifiers.nanogpt),
+					true,
+				)
 			}
 
 			candidates.push({
 				key: providerIdentifiers.nanogpt,
 				options: { provider: providerIdentifiers.nanogpt, apiKey: nanoGptApiKey },
 			})
+
+			// Friendli's /models catalog is public.
+			candidates.push({ key: providerIdentifiers.friendli, options: { provider: providerIdentifiers.friendli } })
 
 			if (!providerFilter || providerFilter === providerIdentifiers.kimiCode) {
 				const { kimiCodeOAuthManager } = await import("../../integrations/kimi-code/oauth")
@@ -1288,12 +1443,12 @@ export const webviewMessageHandler = async (
 			// If refresh flag is set and we have a specific provider, flush its cache first
 			if (shouldRefresh && providerFilter && modelFetchPromises.length > 0) {
 				const targetCandidate = modelFetchPromises[0]
-				await flushModels(targetCandidate.options, true)
+				await flushModels(targetCandidate.options, handlerFor(apiConfiguration, targetCandidate.key), true)
 			}
 
 			const results = await Promise.allSettled(
 				modelFetchPromises.map(async ({ key, options }) => {
-					const models = await safeGetModels(options)
+					const models = await safeGetModels(options, handlerFor(apiConfiguration, key))
 					return { key, models } // The key is `ProviderName` here.
 				}),
 			)
@@ -1343,11 +1498,12 @@ export const webviewMessageHandler = async (
 				baseUrl,
 				apiKey,
 			}
+			const handler = handlerFor(ollamaApiConfig, providerIdentifiers.ollama)
 			try {
 				// Refresh the cache before reading the models. Keep this error
 				// separate from the read below so diagnostics identify which
 				// cache operation failed.
-				await flushModels(ollamaOptions, true)
+				await flushModels(ollamaOptions, handler, true)
 			} catch (error) {
 				const errorMsg = error instanceof Error ? error.message : String(error)
 				provider.log(`[requestOllamaModels] Failed to refresh model cache for ${logBaseUrl}: ${errorMsg}`)
@@ -1360,7 +1516,7 @@ export const webviewMessageHandler = async (
 			}
 
 			try {
-				const ollamaModels = await getModels(ollamaOptions)
+				const ollamaModels = await getModels(ollamaOptions, handler)
 
 				// Always post a response so the webview refresh status can
 				// transition out of "loading" — even when no models are found.
@@ -1390,9 +1546,10 @@ export const webviewMessageHandler = async (
 						provider: providerIdentifiers.lmstudio,
 						baseUrl: lmStudioApiConfig.lmStudioBaseUrl,
 					}
+					const handler = handlerFor(lmStudioApiConfig, providerIdentifiers.lmstudio)
 					// Flush cache and refresh to ensure fresh models.
-					await flushModels(lmStudioOptions, true)
-					lmStudioModels = await getModels(lmStudioOptions)
+					await flushModels(lmStudioOptions, handler, true)
+					lmStudioModels = await getModels(lmStudioOptions, handler)
 				}
 
 				if (Object.keys(lmStudioModels).length > 0) {
@@ -1412,7 +1569,7 @@ export const webviewMessageHandler = async (
 				type: RouterModelsMessageType.singleRouterModelFetchResponse,
 				success: false,
 				error: getRouterRemovalMessage(),
-				values: { provider: "roo" },
+				values: { provider: retiredProviderIdentifiers.roo },
 			})
 			break
 		}
@@ -1428,11 +1585,77 @@ export const webviewMessageHandler = async (
 			}
 
 			break
-		case VsCodeLmModelsMessageType.requestVsCodeLmModels:
-			const vsCodeLmModels = await getVsCodeLmModels()
-			// TODO: Cache like we do for OpenRouter, etc?
-			await provider.postMessageToWebview({ type: VsCodeLmModelsMessageType.vsCodeLmModels, vsCodeLmModels })
+		case VsCodeLmModelsMessageType.githubCopilotSignIn:
+		case VsCodeLmModelsMessageType.githubCopilotReconnect: {
+			// Plain sign-in and Reconnect run as separate attempts, so an older one can finish after a newer one.
+			// Only the latest request may publish, or its account and model list would overwrite newer state.
+			const viewState = getGitHubCopilotViewState(provider)
+			const requestId = ++viewState.signInId
+			viewState.changes++
+			const isLatest = () => viewState.signInId === requestId
+			try {
+				const { models, account } = await connectGitHubCopilot(async (githubCopilotAccount: string) => {
+					if (!isLatest()) return
+					await provider.postMessageToWebview({
+						type: VsCodeLmModelsMessageType.githubCopilotModels,
+						githubCopilotAccount,
+					})
+				}, message.type === VsCodeLmModelsMessageType.githubCopilotReconnect)
+				if (!isLatest()) break
+				await provider.postMessageToWebview({
+					type: VsCodeLmModelsMessageType.githubCopilotSignInResult,
+					vsCodeLmModels: models,
+					githubCopilotAccount: account,
+				})
+			} catch (error) {
+				if (!isLatest()) break
+				await provider.postMessageToWebview({
+					type: VsCodeLmModelsMessageType.githubCopilotSignInResult,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			} finally {
+				if (isLatest()) viewState.changes++
+			}
 			break
+		}
+		case VsCodeLmModelsMessageType.githubCopilotManageAccount:
+			try {
+				await openGitHubAccountManagement()
+			} catch (error) {
+				provider.log(
+					`Could not open VS Code account management: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			}
+			break
+		case VsCodeLmModelsMessageType.requestVsCodeLmModels: {
+			if (message.apiConfiguration?.apiProvider !== providerIdentifiers.githubCopilot) {
+				const vsCodeLmModels = await getVsCodeLmModels()
+				// TODO: Cache like we do for OpenRouter, etc?
+				await provider.postMessageToWebview({ type: VsCodeLmModelsMessageType.vsCodeLmModels, vsCodeLmModels })
+				break
+			}
+			const viewState = getGitHubCopilotViewState(provider)
+			const changesAtStart = viewState.changes
+			const refreshId = ++viewState.refreshId
+			const isOutOfDate = () => viewState.changes !== changesAtStart || viewState.refreshId !== refreshId
+			try {
+				const githubCopilotAccount = await getGitHubCopilotAccount()
+				const vsCodeLmModels = await getGitHubCopilotModels()
+				if (isOutOfDate()) break
+				await provider.postMessageToWebview({
+					type: VsCodeLmModelsMessageType.githubCopilotModels,
+					vsCodeLmModels,
+					githubCopilotAccount: githubCopilotAccount ?? null,
+				})
+			} catch (error) {
+				if (isOutOfDate()) break
+				await provider.postMessageToWebview({
+					type: VsCodeLmModelsMessageType.githubCopilotModels,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+			break
+		}
 		case "openImage":
 			await openImage(message.text!, { values: message.values })
 			break
@@ -1464,13 +1687,70 @@ export const webviewMessageHandler = async (
 				}
 			}
 			break
-		case "openFile":
-			let filePath: string = message.text!
-			if (!path.isAbsolute(filePath)) {
-				filePath = path.join(getCurrentCwd(), filePath)
+		case "openFile": {
+			const rawPath = message.text || ""
+			if (!rawPath) {
+				break
 			}
-			await openFile(filePath, message.values as { create?: boolean; content?: string; line?: number })
+			// Task markdown links are untrusted, so markdown-sourced openFile
+			// requests (flagged by the webview with fromMarkdown) must resolve
+			// inside the current workspace. First-party callers (modes, MCP,
+			// slash-command settings) may legitimately open global config files
+			// outside the workspace, so they keep the previous behavior.
+			const fromMarkdown = message.values?.fromMarkdown === true
+			const rejectOutsideWorkspace = () => {
+				void vscode.window.showErrorMessage(
+					t("common:errors.cannot_access_path", {
+						path: rawPath,
+						error: t("common:errors.path_outside_workspace"),
+					}),
+				)
+			}
+			let filePath = rawPath
+			// Markdown link targets are URL syntax: percent-decode to a fixed point
+			// here, at the containment boundary. openFile decodes AFTER this check,
+			// so a request like `%2e%2e/%2e%2e/.env` would otherwise pass
+			// containment as a literal and escape only after that later decode.
+			if (fromMarkdown) {
+				const decoded = decodeUntrustedPathToStable(rawPath)
+				// Stryker disable next-line ConditionalExpression,BlockStatement: hostile non-stabilizing encodings are unreachable from the webview (its posts are plain link targets); the bound is defensive
+				if (decoded === null) {
+					// Stryker disable next-line CallExpression: hostile non-stabilizing encodings are pinned by the direct decodeUntrustedPathToStable bound test; the webview never posts such values
+					rejectOutsideWorkspace()
+					break
+				}
+				filePath = decoded
+			}
+			if (!path.isAbsolute(filePath)) {
+				const cwd = getCurrentCwd()
+				if (!cwd) {
+					void vscode.window.showErrorMessage(
+						t("common:errors.could_not_open_file", { errorMessage: t("common:errors.no_workspace") }),
+					)
+					break
+				}
+				filePath = path.resolve(cwd, filePath)
+			}
+			// Workspace-boundary validation (defense in depth): the webview already
+			// rejects traversal in markdown anchors, but refuse any markdown path
+			// that still resolves outside the workspace.
+			if (fromMarkdown && isPathOutsideWorkspace(filePath)) {
+				rejectOutsideWorkspace()
+				break
+			}
+			// Lexical containment cannot see symlinks: a link inside a workspace
+			// folder may resolve to a target outside the workspace. Re-check the
+			// real filesystem path (failing closed) before opening.
+			if (fromMarkdown && (await isRealPathOutsideWorkspace(filePath))) {
+				rejectOutsideWorkspace()
+				break
+			}
+			await openFile(
+				filePath,
+				message.values as { create?: boolean; content?: string; line?: number; fromMarkdown?: boolean },
+			)
 			break
+		}
 		case "readFileContent": {
 			const relPath = message.text || ""
 			if (!relPath) {
@@ -1509,6 +1789,29 @@ export const webviewMessageHandler = async (
 			}
 			break
 		}
+		case "readOriginalContent": {
+			const ts = message.messageTs
+
+			if (typeof ts !== "number") {
+				break
+			}
+
+			const task = provider.getCurrentTask()
+			// A request made for another task must not be answered from the current one.
+			const isRequestedTask = message.taskId === undefined || message.taskId === task?.taskId
+			const id = { messageId: message.messageId, ts }
+
+			await provider.postMessageToWebview({
+				type: "originalContent",
+				originalContentInfo: {
+					ts,
+					messageId: message.messageId,
+					taskId: message.taskId,
+					content: isRequestedTask ? findOriginalContent(task?.clineMessages, id) : null,
+				},
+			})
+			break
+		}
 		case "openMention":
 			await openMention(getCurrentCwd(), message.text)
 			break
@@ -1529,19 +1832,30 @@ export const webviewMessageHandler = async (
 			const result = checkoutRestorePayloadSchema.safeParse(message.payload)
 
 			if (result.success) {
-				await provider.cancelTask()
-
 				try {
-					await pWaitFor(() => provider.getCurrentTask()?.isInitialized === true, { timeout: 3_000 })
-				} catch (error) {
-					vscode.window.showErrorMessage(t("common:errors.checkpoint_timeout"))
-					return
-				}
+					const taskBeforeCancel = provider.getCurrentTask()
+					// Reject a bad hash before cancelling, so the running task survives.
+					if (taskBeforeCancel) {
+						assertRecordedCheckpoint(taskBeforeCancel, result.data.commitHash)
+					}
 
-				try {
+					await provider.cancelTask()
+
+					try {
+						await pWaitFor(() => provider.getCurrentTask()?.isInitialized === true, { timeout: 3_000 })
+					} catch {
+						vscode.window.showErrorMessage(t("common:errors.checkpoint_timeout"))
+						return
+					}
+
 					await provider.getCurrentTask()?.checkpointRestore(result.data)
 				} catch (error) {
-					vscode.window.showErrorMessage(t("common:errors.checkpoint_failed"))
+					console.error("[checkpointRestore] checkpointRestore failed:", error)
+					void vscode.window.showErrorMessage(
+						t("common:errors.checkpoint_restore_failed", {
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					)
 				}
 			}
 
@@ -1571,7 +1885,7 @@ export const webviewMessageHandler = async (
 
 				try {
 					await pWaitFor(() => provider.getCurrentTask()?.isInitialized === true, { timeout: 3_000 })
-				} catch (error) {
+				} catch {
 					vscode.window.showErrorMessage(t("common:errors.checkpoint_timeout"))
 					return
 				}
@@ -1591,7 +1905,11 @@ export const webviewMessageHandler = async (
 					})
 				} catch (error) {
 					console.error("[completionCheckpointRestore] checkpointRestore failed:", error)
-					vscode.window.showErrorMessage(t("common:errors.checkpoint_failed"))
+					void vscode.window.showErrorMessage(
+						t("common:errors.checkpoint_restore_failed", {
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					)
 				}
 			}
 
@@ -1997,6 +2315,7 @@ export const webviewMessageHandler = async (
 						includeTaskHistoryInEnhance,
 						currentClineMessages: currentCline?.clineMessages,
 						providerSettingsManager: provider.providerSettingsManager,
+						taskId: currentCline?.taskId,
 					})
 
 					if (result.success && result.enhancedText) {
@@ -2175,6 +2494,20 @@ export const webviewMessageHandler = async (
 				await provider.upsertProviderProfile(message.text, message.apiConfiguration)
 			}
 			break
+		case "updateProfileModel": {
+			const { expectedProvider, patch } = message.values ?? {}
+
+			if (
+				message.text &&
+				typeof expectedProvider === "string" &&
+				patch &&
+				typeof patch === "object" &&
+				!Array.isArray(patch)
+			) {
+				await provider.updateProfileModel(message.text, expectedProvider, patch)
+			}
+			break
+		}
 		case "renameApiConfiguration":
 			if (message.values && message.apiConfiguration) {
 				try {
@@ -2357,7 +2690,7 @@ export const webviewMessageHandler = async (
 							}
 						}
 					}
-				} catch (error) {
+				} catch {
 					// Error already shown to user by updateCustomMode
 					// Just prevent unhandled rejection and skip state updates
 				}
@@ -2612,29 +2945,46 @@ export const webviewMessageHandler = async (
 			}
 			break
 		case "telemetrySetting": {
-			const telemetrySetting = message.text as TelemetrySetting
-			const previousSetting = getGlobalState("telemetrySetting") || "unset"
-			const isOptedIn = telemetrySetting !== "disabled"
-			const wasPreviouslyOptedIn = previousSetting !== "disabled"
+			// Chain onto the shared queue so a concurrent "telemetrySetting" message (e.g. a
+			// rapid toggle) can't interleave its read-write-apply sequence with this one -- see
+			// the telemetrySettingQueue comment above for why that matters. Swallow a prior
+			// link's rejection before chaining (rather than letting .then() propagate it) so one
+			// failed update can't permanently poison every subsequent telemetrySetting message
+			// for the rest of the session.
+			const thisUpdate = telemetrySettingQueue
+				.catch(() => undefined)
+				.then(async () => {
+					const telemetrySetting = message.text as TelemetrySetting
+					const previousSetting = getGlobalState("telemetrySetting") || "unset"
+					const isOptedIn = isTelemetryOptedIn(telemetrySetting)
+					const wasPreviouslyOptedIn = isTelemetryOptedIn(previousSetting)
 
-			// If turning telemetry OFF, fire event BEFORE disabling
-			if (wasPreviouslyOptedIn && !isOptedIn && TelemetryService.hasInstance()) {
-				TelemetryService.instance.captureTelemetrySettingsChanged(previousSetting, telemetrySetting)
-			}
+					// If turning telemetry OFF, fire event BEFORE disabling
+					if (wasPreviouslyOptedIn && !isOptedIn && TelemetryService.hasInstance()) {
+						TelemetryService.instance.captureTelemetrySettingsChanged(previousSetting, telemetrySetting)
+					}
 
-			// Update the telemetry state
-			await updateGlobalState("telemetrySetting", telemetrySetting)
+					// Update the telemetry state. vscode.env.isTelemetryEnabled is ANDed in
+					// (matching extension.ts's onDidChangeTelemetryEnabled listener) so this can't
+					// re-enable telemetry while VS Code's global toggle is off -- the
+					// captureTelemetrySettingsChanged calls above/below still track the user's
+					// stored preference transition on its own, independent of that live toggle.
+					await updateGlobalState("telemetrySetting", telemetrySetting)
 
-			if (TelemetryService.hasInstance()) {
-				TelemetryService.instance.updateTelemetryState(isOptedIn)
-			}
+					if (TelemetryService.hasInstance()) {
+						TelemetryService.instance.updateTelemetryState(isOptedIn && vscode.env.isTelemetryEnabled)
+					}
 
-			// If turning telemetry ON, fire event AFTER enabling
-			if (!wasPreviouslyOptedIn && isOptedIn && TelemetryService.hasInstance()) {
-				TelemetryService.instance.captureTelemetrySettingsChanged(previousSetting, telemetrySetting)
-			}
+					// If turning telemetry ON, fire event AFTER enabling
+					if (!wasPreviouslyOptedIn && isOptedIn && TelemetryService.hasInstance()) {
+						TelemetryService.instance.captureTelemetrySettingsChanged(previousSetting, telemetrySetting)
+					}
 
-			await provider.postStateToWebview()
+					await provider.postStateToWebview()
+				})
+			telemetrySettingQueue = thisUpdate
+
+			await thisUpdate
 			break
 		}
 		case "debugSetting": {
@@ -3010,7 +3360,8 @@ export const webviewMessageHandler = async (
 				await provider.postStateToWebview()
 
 				// Then handle validation and initialization for the current workspace
-				const currentCodeIndexManager = provider.getCurrentWorkspaceCodeIndexManager()
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				const currentCodeIndexManager = scope?.codeIndexManager
 				if (currentCodeIndexManager) {
 					// If embedder provider changed, perform proactive validation
 					if (embedderProviderChanged) {
@@ -3089,7 +3440,8 @@ export const webviewMessageHandler = async (
 		}
 
 		case "requestIndexingStatus": {
-			const manager = provider.getCurrentWorkspaceCodeIndexManager()
+			const scope = provider.getCurrentWorkspaceCodeIndexScope()
+			const manager = scope?.codeIndexManager
 			if (!manager) {
 				// No workspace open - send error status
 				await provider.postMessageToWebview({
@@ -3153,7 +3505,8 @@ export const webviewMessageHandler = async (
 		}
 		case "startIndexing": {
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				const manager = scope?.codeIndexManager
 				if (!manager) {
 					await provider.postMessageToWebview({
 						type: "indexingStatusUpdate",
@@ -3194,15 +3547,15 @@ export const webviewMessageHandler = async (
 		}
 		case "stopIndexing": {
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
-				if (!manager) {
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				if (!scope) {
 					provider.log("Cannot stop indexing: No workspace folder open")
 					return
 				}
-				manager.stopIndexing()
+				scope.codeIndexManager.stopIndexing()
 				await provider.postMessageToWebview({
 					type: "indexingStatusUpdate",
-					values: manager.getCurrentStatus(),
+					values: scope.codeIndexManager.getCurrentStatus(),
 				})
 			} catch (error) {
 				provider.log(`Error stopping indexing: ${error instanceof Error ? error.message : String(error)}`)
@@ -3211,23 +3564,12 @@ export const webviewMessageHandler = async (
 		}
 		case "toggleWorkspaceIndexing": {
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
-				if (!manager) {
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				if (!scope) {
 					provider.log("Cannot toggle workspace indexing: No workspace folder open")
 					return
 				}
-				const enabled = message.bool ?? false
-				await manager.setWorkspaceEnabled(enabled)
-				if (enabled && manager.isFeatureEnabled && manager.isFeatureConfigured) {
-					await manager.initialize(provider.contextProxy)
-					void manager.startIndexing().catch((err) => provider.log(`Indexing error: ${err}`))
-				} else if (!enabled) {
-					manager.stopIndexing()
-				}
-				await provider.postMessageToWebview({
-					type: "indexingStatusUpdate",
-					values: manager.getCurrentStatus(),
-				})
+				await scope.workspaceIndexingEnablementManager.setEnabled(message.bool ?? false, provider)
 			} catch (error) {
 				provider.log(
 					`Error toggling workspace indexing: ${error instanceof Error ? error.message : String(error)}`,
@@ -3237,13 +3579,14 @@ export const webviewMessageHandler = async (
 		}
 		case "setAutoEnableDefault": {
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				const manager = scope?.codeIndexManager
 				if (!manager) {
 					provider.log("Cannot set auto-enable default: No workspace folder open")
 					return
 				}
 				// Capture prior state for every manager before persisting the global change
-				const allManagers = CodeIndexManager.getAllInstances()
+				const allManagers = CodeIndexManagerRegistry.getAllInstances()
 				const priorStates = new Map(allManagers.map((m) => [m, m.isWorkspaceEnabled]))
 				await manager.setAutoEnableDefault(message.bool ?? true)
 				// Apply stop/start to every affected manager
@@ -3270,8 +3613,8 @@ export const webviewMessageHandler = async (
 		}
 		case "clearIndexData": {
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
-				if (!manager) {
+				const scope = provider.getCurrentWorkspaceCodeIndexScope()
+				if (!scope) {
 					provider.log("Cannot clear index data: No workspace folder open")
 					await provider.postMessageToWebview({
 						type: "indexCleared",
@@ -3282,7 +3625,7 @@ export const webviewMessageHandler = async (
 					})
 					return
 				}
-				await manager.clearIndexData()
+				await scope.codeIndexManager.clearIndexData()
 				await provider.postMessageToWebview({ type: "indexCleared", values: { success: true } })
 			} catch (error) {
 				provider.log(`Error clearing index data: ${error instanceof Error ? error.message : String(error)}`)

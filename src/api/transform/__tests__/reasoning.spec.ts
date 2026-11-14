@@ -1,6 +1,7 @@
 // npx vitest run src/api/transform/__tests__/reasoning.spec.ts
 
 import type { ModelInfo, ProviderSettings, ReasoningEffortWithMinimal } from "@roo-code/types"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 import {
 	getOpenRouterReasoning,
@@ -14,7 +15,6 @@ import {
 	AnthropicReasoningParams,
 	AnthropicProviderReasoningParams,
 	OpenAiReasoningParams,
-	RooReasoningParams,
 	GeminiReasoningParams,
 	GeminiThinkingLevel,
 } from "../reasoning"
@@ -476,7 +476,7 @@ describe("reasoning.ts", () => {
 				reasoningBudget: undefined,
 			})
 
-			expect(result).toEqual({ type: "adaptive" })
+			expect(result).toEqual({ type: "adaptive", display: "summarized" })
 		})
 
 		it("should omit thinking for Claude Opus 4.7 when reasoning is disabled", () => {
@@ -703,7 +703,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				enableReasoningEffort: true,
 				reasoningEffort: "high",
 			}
@@ -730,7 +730,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				// Even with this flag false, an explicit effort selection should win
 				enableReasoningEffort: false,
 				reasoningEffort: "high",
@@ -755,7 +755,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "minimal",
 			}
 
@@ -778,7 +778,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "medium",
 			}
 
@@ -809,7 +809,7 @@ describe("reasoning.ts", () => {
 				}
 
 				const settings: ProviderSettings = {
-					apiProvider: "gemini",
+					apiProvider: providerIdentifiers.gemini,
 					reasoningEffort: level,
 				}
 
@@ -833,7 +833,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "disable",
 			}
 
@@ -856,7 +856,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "none",
 			}
 
@@ -880,7 +880,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				enableReasoningEffort: true,
 			}
 
@@ -904,7 +904,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				enableReasoningEffort: true,
 				reasoningEffort: "high",
 			}
@@ -929,7 +929,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 			}
 
 			const options: GetModelReasoningOptions = {
@@ -953,7 +953,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "medium",
 			}
 
@@ -977,7 +977,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "medium",
 			}
 
@@ -1001,7 +1001,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "high",
 			}
 
@@ -1025,7 +1025,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "medium",
 			}
 
@@ -1049,7 +1049,7 @@ describe("reasoning.ts", () => {
 			}
 
 			const settings: ProviderSettings = {
-				apiProvider: "gemini",
+				apiProvider: providerIdentifiers.gemini,
 				reasoningEffort: "minimal",
 			}
 
@@ -1240,7 +1240,7 @@ describe("reasoning.ts", () => {
 				reasoningBudget: undefined,
 			})
 
-			expect(result).toEqual({ type: "adaptive" })
+			expect(result).toEqual({ type: "adaptive", display: "summarized" })
 		})
 
 		it("should return correct types for OpenAI reasoning params", () => {

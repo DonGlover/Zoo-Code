@@ -1,0 +1,521 @@
+import React, { useState } from "react"
+
+type StoryProps = Record<string, unknown>
+type Story = (props: StoryProps) => React.ReactNode | Promise<React.ReactNode>
+
+const mermaidGantt = `gantt
+    title Project plan
+    dateFormat YYYY-MM-DD
+    section Planning
+    Define scope :done, scope, 2026-08-01, 3d
+    section Delivery
+    Ship release :active, release, after scope, 3d`
+
+export const stories: Record<string, Story> = {
+	"terminal-settings": async () => {
+		const [{ AppProviders }, { TerminalSettings }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/TerminalSettings"),
+		])
+		function Settings() {
+			const [collapsed, setCollapsed] = useState(false)
+			return (
+				<div
+					className="w-[420px] p-4 bg-vscode-editor-background text-vscode-foreground"
+					data-testid="terminal-settings-story">
+					<TerminalSettings
+						terminalShellIntegrationDisabled={true}
+						collapseCommandOutputByDefault={collapsed}
+						setCachedStateField={(field, value) => {
+							if (field === "collapseCommandOutputByDefault") setCollapsed(Boolean(value))
+						}}
+					/>
+				</div>
+			)
+		}
+		return (
+			<AppProviders>
+				<Settings />
+			</AppProviders>
+		)
+	},
+	"bedrock-output-budget": async ({ model = "anthropic.claude-opus-5" }) => {
+		const [{ AppProviders }, { ThinkingBudget }, { bedrockModels, providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/ThinkingBudget"),
+			import("@roo-code/types"),
+		])
+		const apiModelId = model === "anthropic.claude-opus-4-8" ? model : "anthropic.claude-opus-5"
+		function Budget() {
+			const [config, setConfig] = useState<import("@roo-code/types").ProviderSettings>({
+				apiProvider: providerIdentifiers.bedrock,
+				apiModelId,
+				enableReasoningEffort: true,
+			})
+			return (
+				<div className="w-[420px] p-4 flex flex-col gap-4 bg-vscode-editor-background">
+					<h2>{apiModelId}</h2>
+					<ThinkingBudget
+						apiConfiguration={config}
+						modelInfo={bedrockModels[apiModelId]}
+						setApiConfigurationField={(field, value) =>
+							setConfig((previous) => ({ ...previous, [field]: value }))
+						}
+					/>
+				</div>
+			)
+		}
+		return (
+			<AppProviders>
+				<Budget />
+			</AppProviders>
+		)
+	},
+	"bedrock-custom-arn": async ({ baseModelId = "" }) => {
+		const [{ AppProviders }, { BedrockCustomArn }, { providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/providers/BedrockCustomArn"),
+			import("@roo-code/types"),
+		])
+		function CustomArn() {
+			const [config, setConfig] = useState<import("@roo-code/types").ProviderSettings>({
+				apiProvider: providerIdentifiers.bedrock,
+				apiModelId: "custom-arn",
+				awsRegion: "us-west-2",
+				awsCustomArn: "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abcd1234efgh",
+				awsCustomArnBaseModelId: String(baseModelId),
+			})
+			return (
+				<div className="w-[480px] p-4 flex flex-col gap-3 bg-vscode-editor-background text-vscode-foreground">
+					<BedrockCustomArn
+						apiConfiguration={config}
+						setApiConfigurationField={(field, value) =>
+							setConfig((previous) => ({ ...previous, [field]: value }))
+						}
+					/>
+				</div>
+			)
+		}
+		return (
+			<AppProviders>
+				<CustomArn />
+			</AppProviders>
+		)
+	},
+	"accessibility-contrast": async () => {
+		const { AccessibilityContrastGallery } =
+			await import("@/components/ui/__tests__/AccessibilityContrast.visual.fixture")
+		return <AccessibilityContrastGallery />
+	},
+	"announcement-links": async () => {
+		const [{ AppProviders }, { default: Announcement }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/chat/Announcement"),
+		])
+		return (
+			<AppProviders>
+				<div className="w-[520px] p-4 bg-vscode-editor-background">
+					<a id="control-link" href="#control">
+						control
+					</a>
+					<Announcement hideAnnouncement={() => undefined} />
+				</div>
+			</AppProviders>
+		)
+	},
+	"api-config-manager": async () => {
+		const [{ AppProviders }, { default: ApiConfigManager }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/ApiConfigManager"),
+		])
+		return (
+			<AppProviders>
+				<div className="w-full p-4" data-testid="api-config-manager-story">
+					<ApiConfigManager
+						currentApiConfigName="Default Config"
+						listApiConfigMeta={[
+							{ id: "default", name: "Default Config" },
+							{ id: "another", name: "Another Config" },
+						]}
+						onSelectConfig={() => undefined}
+						onDeleteConfig={() => undefined}
+						onRenameConfig={() => undefined}
+						onUpsertConfig={() => undefined}
+					/>
+				</div>
+			</AppProviders>
+		)
+	},
+	"api-provider-dropdown": async () => {
+		const [{ AppProviders }, { default: ApiOptions }, { providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/ApiOptions"),
+			import("@roo-code/types"),
+		])
+		const apiConfiguration: import("@roo-code/types").ProviderSettings = {
+			apiProvider: providerIdentifiers.anthropic,
+			apiKey: "sk-ant-example-key",
+		}
+		return (
+			<AppProviders initialState={{ apiConfiguration }}>
+				<div
+					className="w-[480px] p-4 bg-vscode-editor-background text-vscode-foreground"
+					data-testid="api-provider-dropdown-story">
+					<ApiOptions
+						uriScheme="vscode"
+						apiConfiguration={apiConfiguration}
+						setApiConfigurationField={() => undefined}
+						errorMessage={undefined}
+						setErrorMessage={() => undefined}
+					/>
+				</div>
+			</AppProviders>
+		)
+	},
+	"auto-approve-settings": async () => {
+		const { AutoApproveSettingsStory } =
+			await import("@/components/settings/__tests__/AutoApproveSettings.visual.fixture")
+		return <AutoApproveSettingsStory />
+	},
+	"chat-text-area": async () => {
+		const { ChatTextAreaStory } = await import("@/components/chat/__tests__/ChatTextArea.visual.fixture")
+		return <ChatTextAreaStory />
+	},
+	"history-empty": async () => {
+		const [{ AppProviders }, { default: HistoryView }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/history/HistoryView"),
+		])
+		return (
+			<AppProviders initialState={{ taskHistory: [] }}>
+				<div className="h-[640px] w-[480px] max-w-full bg-vscode-editor-background">
+					<HistoryView onDone={() => undefined} />
+				</div>
+			</AppProviders>
+		)
+	},
+	"history-rename": async () => {
+		const [{ AppProviders }, { default: HistoryView }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/history/HistoryView"),
+		])
+		// The visual test freezes the clock at this time so "time ago" labels stay stable.
+		const now = new Date("2026-06-01T12:00:00Z").getTime()
+		const workspace = "/workspace/demo"
+		const baseItem = { tokensIn: 1200, tokensOut: 800, totalCost: 0.12, workspace }
+		return (
+			<AppProviders
+				initialState={{
+					cwd: workspace,
+					taskHistory: [
+						{
+							...baseItem,
+							id: "task-renamed",
+							number: 2,
+							ts: now - 2 * 60 * 60 * 1000,
+							task: "Refactor the authentication middleware to use the new session store",
+							title: "Auth refactor",
+						},
+						{
+							...baseItem,
+							id: "task-original",
+							number: 1,
+							ts: now - 26 * 60 * 60 * 1000,
+							task: "Write unit tests for the billing service",
+						},
+					],
+				}}>
+				<div className="h-[640px] w-[480px] max-w-full bg-vscode-editor-background">
+					<HistoryView onDone={() => undefined} />
+				</div>
+			</AppProviders>
+		)
+	},
+	"ignored-disabled-tools-warning": async () => {
+		const [{ AppProviders }, { ChatRowContent }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/chat/ChatRow"),
+		])
+		// Same payload shape Task.startTask emits, so the snapshot covers ChatRow's
+		// dispatch and locale lookup, not just the isolated warning row.
+		const message: import("@roo-code/types").ClineMessage = {
+			type: "say",
+			say: "ignored_disabled_tools_warning",
+			ts: 0,
+			text: JSON.stringify({ ignoredTools: ["attempt_completion"] }),
+		}
+		return (
+			<AppProviders>
+				<div className="w-full bg-vscode-editor-background px-[15px] py-[10px] text-vscode-foreground">
+					<ChatRowContent
+						message={message}
+						isExpanded={false}
+						isLast={false}
+						isStreaming={false}
+						onToggleExpand={() => undefined}
+						onSuggestionClick={() => undefined}
+						onBatchFileResponse={() => undefined}
+						onFollowUpUnmount={() => undefined}
+						isFollowUpAnswered={false}
+					/>
+				</div>
+			</AppProviders>
+		)
+	},
+	"io-intelligence-settings": async () => {
+		const [{ AppProviders }, { IOIntelligence }, { providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/providers/IOIntelligence"),
+			import("@roo-code/types"),
+		])
+		type ProviderSettings = React.ComponentProps<typeof IOIntelligence>["apiConfiguration"]
+
+		function IOIntelligenceSettingsStory() {
+			const [apiConfiguration, setApiConfiguration] = useState<ProviderSettings>({
+				apiProvider: providerIdentifiers.ioIntelligence,
+			})
+			return (
+				<div className="w-full p-4 bg-vscode-editor-background" data-testid="io-intelligence-settings-story">
+					<div className="flex flex-col gap-3">
+						<IOIntelligence
+							apiConfiguration={apiConfiguration}
+							setApiConfigurationField={(field, value) =>
+								setApiConfiguration((current) => ({ ...current, [field]: value }))
+							}
+							organizationAllowList={{ allowAll: true, providers: {} }}
+						/>
+					</div>
+				</div>
+			)
+		}
+
+		return (
+			<AppProviders initialState={{ apiConfiguration: { apiProvider: providerIdentifiers.ioIntelligence } }}>
+				<IOIntelligenceSettingsStory />
+			</AppProviders>
+		)
+	},
+	"layout-clipped-text": () => (
+		<div className="w-40">
+			<span data-testid="clipped-direct-text" className="block w-8 overflow-hidden whitespace-nowrap">
+				Clipped direct text
+			</span>
+		</div>
+	),
+	"layout-screen-reader-only": () => (
+		<div>
+			<label className="sr-only">Hidden label</label>
+			<div className="sr-only">
+				<button>Hidden action</button>
+			</div>
+		</div>
+	),
+	"mermaid-gantt": async () => {
+		const { default: MermaidBlock } = await import("@/components/common/MermaidBlock")
+		return <MermaidBlock code={mermaidGantt} />
+	},
+	"model-info": async () => {
+		const { ModelInfoViewFixture } = await import("@/components/settings/__tests__/ModelInfoView.visual.fixture")
+		return <ModelInfoViewFixture />
+	},
+	"ollama-api-key-help": async () => {
+		const { OllamaApiKeyHelpFixture } =
+			await import("@/components/settings/providers/__tests__/Ollama.visual.fixture")
+		return <OllamaApiKeyHelpFixture />
+	},
+	"openai-codex": async () => {
+		const { OpenAICodexFixture } =
+			await import("@/components/settings/providers/__tests__/OpenAICodex.visual.fixture")
+		return <OpenAICodexFixture />
+	},
+	"openai-compatible-azure": async () => {
+		const { OpenAICompatibleAzureFixture } =
+			await import("@/components/settings/providers/__tests__/OpenAICompatible.visual.fixture")
+		return <OpenAICompatibleAzureFixture />
+	},
+	"openai-compatible-extra-body": async () => {
+		const { OpenAICompatibleExtraBodyFixture } =
+			await import("@/components/settings/providers/__tests__/OpenAICompatible.visual.fixture")
+		return <OpenAICompatibleExtraBodyFixture />
+	},
+	"opencode-go-temperature": async () => {
+		const { OpencodeGoTemperatureFixture } =
+			await import("@/components/settings/__tests__/OpencodeGoTemperature.visual.fixture")
+		return <OpencodeGoTemperatureFixture />
+	},
+	"rendered-content-contrast": async () => {
+		const [{ AppProviders }, { RenderedContentContrastFixture }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/common/__tests__/RenderedContentContrast.visual.fixture"),
+		])
+		return (
+			<AppProviders>
+				<RenderedContentContrastFixture />
+			</AppProviders>
+		)
+	},
+	"roo-hero": async () => {
+		const { default: RooHero } = await import("@/components/welcome/RooHero")
+		return <RooHero />
+	},
+	"telemetry-banner": async () => {
+		const [{ TelemetryBannerFixture }, { visualTestI18nReady }] = await Promise.all([
+			import("@/components/common/__tests__/TelemetryBanner.visual.fixture"),
+			import("@/components/common/__tests__/TelemetryBanner.visual.i18n"),
+		])
+		await visualTestI18nReady
+		return <TelemetryBannerFixture />
+	},
+	"theme-aware-controls": async () => {
+		const [{ SelectDropdown }, { default: UpdateTodoListToolBlock }] = await Promise.all([
+			import("@/components/ui/select-dropdown"),
+			import("@/components/chat/UpdateTodoListToolBlock"),
+		])
+		type Todo = NonNullable<React.ComponentProps<typeof UpdateTodoListToolBlock>["todos"]>[number]
+
+		function ThemeAwareControlsStory() {
+			const [value, setValue] = useState("code")
+			const [todos, setTodos] = useState<Todo[]>([
+				{ id: "todo-1", content: "Ship the follow-up", status: "in_progress" },
+			])
+			return (
+				<div className="flex flex-col gap-4 w-96">
+					<SelectDropdown value={value} options={[{ value: "code", label: "Code" }]} onChange={setValue} />
+					<UpdateTodoListToolBlock todos={todos} onChange={setTodos} />
+				</div>
+			)
+		}
+
+		return <ThemeAwareControlsStory />
+	},
+	"theme-sensitive-status": async () => {
+		const [{ AppProviders }, { ThemeSensitiveStatusFixture }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/chat/__tests__/ThemeSensitiveStatus.visual.fixture"),
+		])
+		return (
+			<AppProviders>
+				<ThemeSensitiveStatusFixture />
+			</AppProviders>
+		)
+	},
+	"theme-token-cleanup": async () => {
+		const [{ Checkbox }, { enabledChatControlClassName }] = await Promise.all([
+			import("@/components/ui/checkbox"),
+			import("@/components/chat/chatControlStyles"),
+		])
+		return (
+			<div className="flex flex-col gap-3 w-96">
+				<button aria-label="Settings" className={enabledChatControlClassName}>
+					Settings
+				</button>
+				<Checkbox aria-label="Include optional context" variant="description" checked />
+			</div>
+		)
+	},
+	"github-copilot-settings": async () => {
+		const [{ AppProviders }, { VSCodeLM }, { providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/providers/VSCodeLM"),
+			import("@roo-code/types"),
+		])
+		function CopilotSettings() {
+			const [config, setConfig] = useState<import("@roo-code/types").ProviderSettings>({
+				apiProvider: providerIdentifiers.githubCopilot,
+				vsCodeLmModelSelector: { vendor: "copilot", id: "gpt-5.5", family: "gpt-5.5", version: "1" },
+			})
+			return (
+				<div data-testid="github-copilot-settings" className="w-[420px] p-4 bg-vscode-editor-background">
+					<VSCodeLM
+						apiConfiguration={config}
+						setApiConfigurationField={(field, value) =>
+							setConfig((previous) => ({ ...previous, [field]: value }))
+						}
+					/>
+				</div>
+			)
+		}
+		return (
+			<AppProviders>
+				<CopilotSettings />
+			</AppProviders>
+		)
+	},
+	"chat-row-timestamps": async () => {
+		const { ChatRowTimestampsStory } = await import("@/components/chat/__tests__/MessageTimestamps.visual.fixture")
+		return <ChatRowTimestampsStory />
+	},
+	"task-header-timestamp": async () => {
+		const { TaskHeaderTimestampStory } =
+			await import("@/components/chat/__tests__/MessageTimestamps.visual.fixture")
+		return <TaskHeaderTimestampStory />
+	},
+	"task-item-footer-absolute": async () => {
+		const { TaskItemFooterAbsoluteStory } =
+			await import("@/components/chat/__tests__/MessageTimestamps.visual.fixture")
+		return <TaskItemFooterAbsoluteStory />
+	},
+	"language-settings": async () => {
+		const { LanguageSettingsStory } =
+			await import("@/components/settings/__tests__/LanguageSettings.visual.fixture")
+		return <LanguageSettingsStory />
+	},
+	"anthropic-settings": async () => {
+		const [{ AppProviders }, { Anthropic }, { providerIdentifiers }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/settings/providers/Anthropic"),
+			import("@roo-code/types"),
+		])
+		function AnthropicSettings() {
+			const [config, setConfig] = useState<import("@roo-code/types").ProviderSettings>({
+				apiProvider: providerIdentifiers.anthropic,
+				apiKey: "sk-ant-example-key",
+			})
+			return (
+				<div data-testid="anthropic-settings-story" className="w-[420px] p-4 bg-vscode-editor-background">
+					<div className="flex flex-col gap-3">
+						<Anthropic
+							apiConfiguration={config}
+							setApiConfigurationField={(field, value) =>
+								setConfig((previous) => ({ ...previous, [field]: value }))
+							}
+						/>
+					</div>
+				</div>
+			)
+		}
+		return (
+			<AppProviders>
+				<AnthropicSettings />
+			</AppProviders>
+		)
+	},
+	"ui-settings": async () => {
+		const { UISettingsStory } = await import("@/components/settings/__tests__/UISettings.visual.fixture")
+		return <UISettingsStory />
+	},
+	"prompts-settings": async () => {
+		const { PromptsSettingsStory } = await import("@/components/settings/__tests__/PromptsSettings.visual.fixture")
+		return <PromptsSettingsStory />
+	},
+	"experimental-settings": async () => {
+		const { ExperimentalSettingsStory } =
+			await import("@/components/settings/__tests__/ExperimentalSettings.visual.fixture")
+		return <ExperimentalSettingsStory />
+	},
+	"ui-settings-long-locale": async () => {
+		const { UISettingsStory } = await import("@/components/settings/__tests__/UISettings.visual.fixture")
+		return <UISettingsStory initialState={{ language: "ru" }} />
+	},
+	welcome: async () => {
+		const [{ AppProviders }, { WelcomeLanding }] = await Promise.all([
+			import("../AppProviders"),
+			import("@/components/welcome/WelcomeLanding"),
+		])
+		return (
+			<AppProviders initialState={{ apiConfiguration: {} }}>
+				<WelcomeLanding onGetStarted={() => undefined} onImportSettings={() => undefined} />
+			</AppProviders>
+		)
+	},
+}

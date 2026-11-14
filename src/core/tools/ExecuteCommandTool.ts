@@ -1,4 +1,6 @@
+import { markToolRejected } from "../task/toolExecutionContext"
 import fs from "fs/promises"
+import { constants as fsConstants } from "fs"
 import * as path from "path"
 import * as vscode from "vscode"
 
@@ -7,8 +9,11 @@ import delay from "delay"
 import { CommandExecutionStatus, DEFAULT_TERMINAL_OUTPUT_PREVIEW_SIZE, PersistedCommandOutput } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 
-import { Task } from "../task/Task"
+import { buildAutoDenyReason, checkAutoApproval } from "../auto-approval"
+import { BLANKET_DENY_AUTO_DENY_KINDS, isBlanketDenyEngaged, Task } from "../task/Task"
+import type { ClineProvider } from "../webview/ClineProvider"
 
+import type { DcgDecision } from "../../services/destructive-command-guard"
 import { ToolUse, ToolResponse } from "../../shared/tools"
 import { formatResponse } from "../prompts/responses"
 import { unescapeHtmlEntities } from "../../utils/text-normalization"
@@ -75,12 +80,42 @@ export function resolveAgentTimeoutMs(timeoutSeconds: number | null | undefined)
 	return process.env.ROO_CLI_RUNTIME === "1" ? 0 : requestedAgentTimeout
 }
 
+async function commandWorkingDirectoryError(workingDirectory: string): Promise<string | undefined> {
+	try {
+		const stats = await fs.stat(workingDirectory)
+		if (!stats.isDirectory()) {
+			return `Working directory '${workingDirectory}' is not a directory.`
+		}
+		// X_OK on a directory checks search permission, which spawning with it as cwd requires.
+		await fs.access(workingDirectory, fsConstants.X_OK)
+		return undefined
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined
+		if (code === "EACCES" || code === "EPERM") {
+			return `Working directory '${workingDirectory}' is not accessible (permission denied).`
+		}
+		if (code === "ENOENT") {
+			return `Working directory '${workingDirectory}' does not exist.`
+		}
+		if (code === "ENOTDIR") {
+			return `Working directory '${workingDirectory}' is not a directory.`
+		}
+		return `Unable to access working directory '${workingDirectory}': ${error instanceof Error ? error.message : String(error)}`
+	}
+}
+
+// Fire-and-forget: some call sites are synchronous terminal callbacks that cannot await,
+// and postMessageToWebview swallows its own errors, so void is enough.
+function postCommandExecutionStatus(provider: ClineProvider | undefined, status: CommandExecutionStatus): void {
+	void provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+}
+
 export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 	readonly name = "execute_command" as const
 
 	async execute(params: ExecuteCommandParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
 		const { command, cwd: customCwd, timeout: timeoutSeconds } = params
-		const { handleError, pushToolResult, askApproval } = callbacks
+		const { handleError, pushToolResult, askApproval, toolCallId } = callbacks
 
 		try {
 			if (!command) {
@@ -115,15 +150,25 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 					status: "error",
 					message: parseError.message,
 				}
-				provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(errorStatus) })
+				postCommandExecutionStatus(provider, errorStatus)
 				task.didToolFailInCurrentTurn = true
 				pushToolResult(formatResponse.toolError(parseError.message))
 				return
 			}
-
 			const provider = await task.providerRef.deref()
-			let dcgBlocked = false
+			let dcgDecision: DcgDecision | undefined
 			if (provider?.contextProxy.getValue("destructiveCommandGuardEnabled") === true) {
+				const workingDirectory = customCwd
+					? path.isAbsolute(customCwd)
+						? customCwd
+						: path.resolve(task.cwd, customCwd)
+					: task.cwd
+				const workingDirectoryError = await commandWorkingDirectoryError(workingDirectory)
+				if (workingDirectoryError) {
+					task.didToolFailInCurrentTurn = true
+					pushToolResult(formatResponse.toolError(workingDirectoryError))
+					return
+				}
 				const { ensureDcgInstalled, runDcg } = await import("../../services/destructive-command-guard")
 				// Resolve through the managed installer on use so an extension update
 				// automatically installs the newly pinned and verified DCG version.
@@ -131,32 +176,134 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 				if (!binaryPath) {
 					throw new Error(t("common:errors.destructiveCommandGuard.unavailable"))
 				}
-				const workingDirectory = customCwd
-					? path.isAbsolute(customCwd)
-						? customCwd
-						: path.resolve(task.cwd, customCwd)
-					: task.cwd
-				const dcgResult = await runDcg(binaryPath, canonicalCommand, workingDirectory)
-				dcgBlocked = dcgResult.decision === "deny"
-				if (dcgResult.decision === "deny") {
-					await task.say("error", formatDcgBlockedMessage(dcgResult.reason, dcgResult.ruleId))
+				// Use the same validated directory as terminal execution. A missing cwd
+				// also surfaces as spawn ENOENT and can be mistaken for a missing binary.
+				// Infra failures (spawn/parse/timeout) reject here and surface as a
+				// retryable tool_error via the outer catch — never as a policy denial.
+				dcgDecision = await runDcg(binaryPath, canonicalCommand, workingDirectory)
+				if (dcgDecision.decision === "deny") {
+					await task.say("error", formatDcgBlockedMessage(dcgDecision.reason, dcgDecision.ruleId))
 				}
 			}
 
-			// DCG-approved commands are auto-approved by checkAutoApproval. A DCG
-			// block is presented as Zoo's normal command prompt, with isProtected
-			// forcing the user to explicitly choose whether to execute it.
-			const didApprove = dcgBlocked
-				? await askApproval("command", canonicalCommand, undefined, true)
-				: await askApproval("command", canonicalCommand)
+			// The blanket auto-deny setting only engages while command auto-approval
+			// is on. A DCG block keeps its protected user prompt unless the blanket
+			// setting is fully engaged, in which case it is auto-denied. This
+			// snapshot governs only how the ask is presented; after approval, the
+			// engagement, the command policy, and terminal behavior are re-derived
+			// from a fresh read (below), so a settings flip during a pending prompt
+			// takes effect — engaging blanket deny denies the command instead of
+			// executing it. A blanket off-flip landing between this snapshot and
+			// Task.ask's own re-read routes a DCG block to the normal prompt instead
+			// of the protected one; a user still decides either way, so the snapshot
+			// stays.
+			const providerState = await provider?.getState()
+			const blanketAutoDeny = isBlanketDenyEngaged(providerState)
+
+			// Outside blanket mode a DCG block is presented as the protected
+			// prompt. This flag governs prompt presentation only: protection is a
+			// property of the policy that produced the prompt, so the execute-time
+			// re-check re-derives it from the fresh state rather than reusing this
+			// value (below).
+			const isProtectedAsk = dcgDecision !== undefined && dcgDecision.decision === "deny" && !blanketAutoDeny
+
+			// DCG-approved commands are auto-approved by checkAutoApproval (from the
+			// passed verdict). A DCG block is either auto-denied with the guard's
+			// reason delivered to the model (blanket mode), or presented as Zoo's
+			// normal command prompt, with isProtected forcing the user to explicitly
+			// choose whether to execute it.
+			let didApprove: boolean
+			if (dcgDecision === undefined) {
+				didApprove = await askApproval("command", canonicalCommand)
+			} else if (dcgDecision.decision === "allow") {
+				didApprove = await askApproval("command", canonicalCommand, undefined, false, { dcgDecision })
+			} else if (blanketAutoDeny) {
+				didApprove = await askApproval("command", canonicalCommand, undefined, false, { dcgDecision })
+			} else {
+				didApprove = await askApproval("command", canonicalCommand, undefined, isProtectedAsk)
+			}
 
 			if (!didApprove) {
 				return
 			}
 
 			const executionId = task.lastMessageTs?.toString() ?? Date.now().toString()
-			const providerState = await provider?.getState()
-			const { terminalShellIntegrationDisabled = true } = providerState ?? {}
+			// Re-read after approval so a settings flip while the approval prompt
+			// was pending is honored for terminal behavior and policy.
+			const freshState = await provider?.getState()
+			const { terminalShellIntegrationDisabled = true } = freshState ?? {}
+
+			if (isBlanketDenyEngaged(freshState)) {
+				// Execute-time re-validate: the approval rode on the pre-ask
+				// snapshot, so a blanket-deny engagement that landed between the
+				// approval and this point would otherwise execute a command the
+				// fresh policy denies. Parity call with the drain-site re-check,
+				// forwarding the verdict already computed above — re-running the
+				// guard would respawn the process for no new information. A fresh
+				// policy that still approves executes normally. Protection is
+				// re-derived from the fresh state, not latched from the prompt:
+				// `isProtected` short-circuits the command policy to an ask before
+				// any denial is evaluated, so forwarding the ask-time flag would
+				// let a DCG block approved during the dwell execute even though
+				// the blanket setting is now on. Inside this branch blanket deny
+				// is engaged, so the protection rule (`DCG block && blanket off`)
+				// cannot hold under the current policy — the fresh derivation is
+				// `false`, and the blanket denial is evaluated. Routing keeps the
+				// ask-path distinction: `guard_unavailable` marks a guard-state
+				// inconsistency (retryable error, not a policy denial, and no
+				// latch); blanket kinds latch the turn so a queue message left by
+				// this denial cannot be consumed as approval by a later ask.
+				// Consulting the latch instead of the policy would deny commands
+				// whose own approval was legal, inverting approval semantics.
+				const recheck = await checkAutoApproval({
+					state: freshState,
+					cwd: task.cwd,
+					ask: "command",
+					text: canonicalCommand,
+					isProtected: false,
+					dcgDecision,
+				})
+				if (recheck.decision === "deny") {
+					const detail = recheck.autoDeny
+					// Fail closed: a deny without structured detail (permitted by the
+					// result type, produced by no command-policy branch today) must
+					// still block execution — it rides the retryable-error channel
+					// like `guard_unavailable` instead of falling through to the terminal.
+					if (!detail || detail.kind === "guard_unavailable") {
+						pushToolResult(
+							formatResponse.toolError(
+								detail
+									? buildAutoDenyReason(detail)
+									: `Command \`${canonicalCommand}\` was not executed: the command policy denied it without a reason. You may retry the same command.`,
+							),
+						)
+						return
+					}
+					if (BLANKET_DENY_AUTO_DENY_KINDS.has(detail.kind)) {
+						task.recordBlanketCommandDenial()
+					}
+					pushToolResult(
+						formatResponse.toolAutoDenied({
+							reason: buildAutoDenyReason(detail),
+							offendingCommand: detail.command,
+							ruleId: detail.dcgRuleId,
+						}),
+					)
+					return
+				} else if (recheck.decision !== "approve") {
+					// Fail closed on every non-approval, not just `deny`: with
+					// blanket engaged the command policy should never answer
+					// `ask`/`timeout` here, but the result union allows it, and an
+					// unexpected non-approval must not reach the terminal. Retry
+					// is safe — nothing ran and nothing latched.
+					pushToolResult(
+						formatResponse.toolError(
+							`Command \`${canonicalCommand}\` was not executed: the fresh command policy re-check returned "${recheck.decision}" instead of an approval. You may retry the same command.`,
+						),
+					)
+					return
+				}
+			}
 
 			// Get command execution timeout from VSCode configuration (in seconds)
 			const commandExecutionTimeoutSeconds = vscode.workspace
@@ -186,13 +333,14 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 				terminalShellIntegrationDisabled,
 				commandExecutionTimeout,
 				agentTimeout,
+				toolCallId,
 			}
 
 			try {
 				const [rejected, result] = await executeCommandInTerminal(task, options)
 
 				if (rejected) {
-					task.didRejectTool = true
+					markToolRejected(task, toolCallId)
 				}
 
 				pushToolResult(result)
@@ -203,7 +351,7 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 				if (canRetryShellIntegrationError(error)) {
 					// Silent retry via execa — shell startup race, command was not submitted.
 					const status: CommandExecutionStatus = { executionId, status: "fallback" }
-					provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+					postCommandExecutionStatus(provider, status)
 
 					const [rejected, result] = await executeCommandInTerminal(task, {
 						...options,
@@ -211,7 +359,7 @@ export class ExecuteCommandTool extends BaseTool<"execute_command"> {
 					})
 
 					if (rejected) {
-						task.didRejectTool = true
+						markToolRejected(task, toolCallId)
 					}
 
 					pushToolResult(result)
@@ -249,6 +397,7 @@ export type ExecuteCommandOptions = {
 	terminalShellIntegrationDisabled?: boolean
 	commandExecutionTimeout?: number
 	agentTimeout?: number
+	toolCallId: string
 }
 
 export async function executeCommandInTerminal(
@@ -260,12 +409,12 @@ export async function executeCommandInTerminal(
 		terminalShellIntegrationDisabled = true,
 		commandExecutionTimeout = 0,
 		agentTimeout = 0,
+		toolCallId,
 	}: ExecuteCommandOptions,
 ): Promise<[boolean, ToolResponse]> {
 	// Convert milliseconds back to seconds for display purposes.
 	const commandExecutionTimeoutSeconds = commandExecutionTimeout / 1000
 	let workingDir: string
-
 	if (!customCwd) {
 		workingDir = task.cwd
 	} else if (path.isAbsolute(customCwd)) {
@@ -274,10 +423,9 @@ export async function executeCommandInTerminal(
 		workingDir = path.resolve(task.cwd, customCwd)
 	}
 
-	try {
-		await fs.access(workingDir)
-	} catch (error) {
-		return [false, `Working directory '${workingDir}' does not exist.`]
+	const workingDirectoryError = await commandWorkingDirectoryError(workingDir)
+	if (workingDirectoryError) {
+		return [false, workingDirectoryError]
 	}
 
 	let runInBackground = false
@@ -294,7 +442,7 @@ export async function executeCommandInTerminal(
 	// panel immediately (same effect as the retry-fallback path).
 	if (isCmdExeFallback) {
 		const status: CommandExecutionStatus = { executionId, status: "fallback" }
-		provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+		postCommandExecutionStatus(provider, status)
 	}
 
 	// Get global storage path for persisted output artifacts
@@ -394,7 +542,7 @@ export async function executeCommandInTerminal(
 			const compressedOutput = Terminal.compressTerminalOutput(accumulatedOutput)
 			latestCompressedOutput = compressedOutput
 			const status: CommandExecutionStatus = { executionId, status: "output", output: compressedOutput }
-			provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+			postCommandExecutionStatus(provider, status)
 			schedulePartialCommandOutputUpdate()
 		},
 		onCompleted: async (output: string | undefined) => {
@@ -433,11 +581,11 @@ export async function executeCommandInTerminal(
 		},
 		onShellExecutionStarted: (pid: number | undefined) => {
 			const status: CommandExecutionStatus = { executionId, status: "started", pid, command }
-			provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+			postCommandExecutionStatus(provider, status)
 		},
 		onShellExecutionComplete: (details: ExitCodeDetails) => {
 			const status: CommandExecutionStatus = { executionId, status: "exited", exitCode: details.exitCode }
-			provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+			postCommandExecutionStatus(provider, status)
 			exitDetails = details
 		},
 	}
@@ -461,7 +609,7 @@ export async function executeCommandInTerminal(
 	}
 
 	const process = terminal.runCommand(command, callbacks)
-	task.terminalProcess = process
+	task.terminalProcesses.set(toolCallId, process)
 
 	// Dual-timeout logic:
 	// - Agent timeout: transitions the command to background (continues running)
@@ -495,7 +643,7 @@ export async function executeCommandInTerminal(
 				new Promise<void>((_, reject) => {
 					userTimeoutId = setTimeout(() => {
 						isUserTimedOut = true
-						task.terminalProcess?.abort()
+						process.abort()
 						reject(new Error(`Command execution timed out after ${commandExecutionTimeout}ms`))
 					}, commandExecutionTimeout)
 				}),
@@ -506,11 +654,9 @@ export async function executeCommandInTerminal(
 	} catch (error) {
 		if (isUserTimedOut) {
 			const status: CommandExecutionStatus = { executionId, status: "timeout" }
-			provider?.postMessageToWebview({ type: "commandExecutionStatus", text: JSON.stringify(status) })
+			postCommandExecutionStatus(provider, status)
 			await task.say("error", t("common:errors:command_timeout", { seconds: commandExecutionTimeoutSeconds }))
 			task.didToolFailInCurrentTurn = true
-			task.terminalProcess = undefined
-
 			return [
 				false,
 				`The command was terminated after exceeding a user-configured ${commandExecutionTimeoutSeconds}s timeout. Do not try to re-run the command.`,
@@ -521,7 +667,7 @@ export async function executeCommandInTerminal(
 		clearTimeout(agentTimeoutId)
 		clearTimeout(userTimeoutId)
 		clearTimeout(pendingCommandOutputEmitTimer)
-		task.terminalProcess = undefined
+		task.terminalProcesses.delete(toolCallId)
 	}
 
 	if (shellIntegrationError) {

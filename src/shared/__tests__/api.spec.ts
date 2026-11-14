@@ -1,6 +1,7 @@
 import { type ModelInfo, type ProviderSettings, ANTHROPIC_DEFAULT_MAX_TOKENS } from "@roo-code/types"
 
 import { getModelMaxOutputTokens, shouldUseReasoningBudget, shouldUseReasoningEffort } from "../api"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 describe("getModelMaxOutputTokens", () => {
 	const mockModel: ModelInfo = {
@@ -11,7 +12,7 @@ describe("getModelMaxOutputTokens", () => {
 
 	test("should return model maxTokens when maxTokens is within 20% of context window", () => {
 		const settings: ProviderSettings = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 		}
 
 		// mockModel has maxTokens: 8192 and contextWindow: 200000
@@ -33,7 +34,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 			enableReasoningEffort: true,
 			modelMaxTokens: 32000,
 		}
@@ -72,12 +73,36 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 			enableReasoningEffort: false, // Not using reasoning
 		}
 
 		const result = getModelMaxOutputTokens({ modelId: anthropicModelId, model, settings })
 		expect(result).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS) // Should be 8192, not 64_000
+	})
+
+	test.each([
+		[32_000, 32_000],
+		[160_000, 128_000],
+		[undefined, ANTHROPIC_DEFAULT_MAX_TOKENS],
+		[0, ANTHROPIC_DEFAULT_MAX_TOKENS],
+		[-1, ANTHROPIC_DEFAULT_MAX_TOKENS],
+	])("handles hybrid output override %s without reasoning", (modelMaxTokens, expected) => {
+		const model: ModelInfo = {
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			supportsPromptCache: true,
+			supportsReasoningBudget: true,
+			supportsMaxTokens: true,
+		}
+
+		expect(
+			getModelMaxOutputTokens({
+				modelId: "anthropic.claude-sonnet-5",
+				model,
+				settings: { enableReasoningEffort: false, modelMaxTokens },
+			}),
+		).toBe(expected)
 	})
 
 	test("should preserve Anthropic hybrid token handling when a model also supports binary reasoning", () => {
@@ -93,7 +118,7 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-4-7",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: false },
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
 			}),
 		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
 
@@ -101,7 +126,11 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-4-7",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: true, modelMaxTokens: 32_768 },
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
 			}),
 		).toBe(32_768)
 	})
@@ -122,7 +151,7 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-4-8",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: false },
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
 			}),
 		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
 
@@ -130,7 +159,11 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-4-8",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: true, modelMaxTokens: 32_768 },
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
 			}),
 		).toBe(32_768)
 	})
@@ -149,7 +182,7 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-fable-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: false },
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
 			}),
 		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
 
@@ -157,7 +190,11 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-fable-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: true, modelMaxTokens: 32_768 },
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
 			}),
 		).toBe(32_768)
 	})
@@ -176,7 +213,7 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-sonnet-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: false },
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
 			}),
 		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
 
@@ -184,7 +221,11 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-sonnet-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: true, modelMaxTokens: 32_768 },
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
 			}),
 		).toBe(32_768)
 	})
@@ -203,7 +244,7 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: false },
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
 			}),
 		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
 
@@ -211,7 +252,42 @@ describe("getModelMaxOutputTokens", () => {
 			getModelMaxOutputTokens({
 				modelId: "claude-opus-5",
 				model,
-				settings: { apiProvider: "anthropic", enableReasoningEffort: true, modelMaxTokens: 32_768 },
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
+			}),
+		).toBe(32_768)
+	})
+
+	test("should preserve Anthropic hybrid token handling for Claude Haiku 5.5", () => {
+		const model: ModelInfo = {
+			contextWindow: 1_000_000,
+			supportsPromptCache: true,
+			supportsReasoningBudget: true,
+			supportsReasoningBinary: true,
+			supportsTemperature: false,
+			maxTokens: 128_000,
+		}
+
+		expect(
+			getModelMaxOutputTokens({
+				modelId: "claude-haiku-5-5",
+				model,
+				settings: { apiProvider: providerIdentifiers.anthropic, enableReasoningEffort: false },
+			}),
+		).toBe(ANTHROPIC_DEFAULT_MAX_TOKENS)
+
+		expect(
+			getModelMaxOutputTokens({
+				modelId: "claude-haiku-5-5",
+				model,
+				settings: {
+					apiProvider: providerIdentifiers.anthropic,
+					enableReasoningEffort: true,
+					modelMaxTokens: 32_768,
+				},
 			}),
 		).toBe(32_768)
 	})
@@ -226,7 +302,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "gemini",
+			apiProvider: providerIdentifiers.gemini,
 			enableReasoningEffort: false, // Not using reasoning
 		}
 
@@ -242,7 +318,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "openai",
+			apiProvider: providerIdentifiers.openai,
 		}
 
 		const result = getModelMaxOutputTokens({
@@ -263,7 +339,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 		}
 
 		const result = getModelMaxOutputTokens({
@@ -283,7 +359,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "openai",
+			apiProvider: providerIdentifiers.openai,
 		}
 
 		const result = getModelMaxOutputTokens({
@@ -303,7 +379,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "openai",
+			apiProvider: providerIdentifiers.openai,
 		}
 
 		// Test various GPT-5 model IDs
@@ -330,7 +406,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "zai",
+			apiProvider: providerIdentifiers.zai,
 			modelMaxTokens: 64_000, // user override, above 20% of the context window (40k)
 		}
 
@@ -348,7 +424,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "zai",
+			apiProvider: providerIdentifiers.zai,
 			modelMaxTokens: 999_999, // beyond the model ceiling
 		}
 
@@ -364,7 +440,7 @@ describe("getModelMaxOutputTokens", () => {
 		}
 
 		const settings: ProviderSettings = {
-			apiProvider: "openai",
+			apiProvider: providerIdentifiers.openai,
 		}
 
 		// Test non-GPT-5 model IDs
@@ -411,7 +487,7 @@ describe("getModelMaxOutputTokens", () => {
 			const result = getModelMaxOutputTokens({
 				modelId: "gpt-5-turbo",
 				model,
-				settings: { apiProvider: "openai" },
+				settings: { apiProvider: providerIdentifiers.openai },
 				format: "openai",
 			})
 
@@ -430,7 +506,7 @@ describe("getModelMaxOutputTokens", () => {
 		const result = getModelMaxOutputTokens({
 			modelId: "glm-5.1",
 			model,
-			settings: { apiProvider: "zai" },
+			settings: { apiProvider: providerIdentifiers.zai },
 			format: "openai",
 		})
 
@@ -447,7 +523,7 @@ describe("getModelMaxOutputTokens", () => {
 		const result = getModelMaxOutputTokens({
 			modelId: "glm-5.1",
 			model,
-			settings: { apiProvider: "openai" },
+			settings: { apiProvider: providerIdentifiers.openai },
 			format: "openai",
 		})
 
@@ -649,9 +725,9 @@ describe("shouldUseReasoningEffort", () => {
 		const model: ModelInfo = {
 			contextWindow: 100_000,
 			supportsPromptCache: true,
-			supportsReasoningEffort: ["disable", "low", "medium", "high"] as unknown as any,
+			supportsReasoningEffort: ["disable", "low", "medium", "high"],
 		}
-		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "disable" as any }
+		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "disable" }
 		expect(shouldUseReasoningEffort({ model, settings })).toBe(false)
 	})
 
@@ -659,9 +735,9 @@ describe("shouldUseReasoningEffort", () => {
 		const model: ModelInfo = {
 			contextWindow: 100_000,
 			supportsPromptCache: true,
-			supportsReasoningEffort: ["none", "minimal", "low", "medium", "high"] as unknown as any,
+			supportsReasoningEffort: ["none", "minimal", "low", "medium", "high"],
 		}
-		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "none" as any }
+		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "none" }
 		expect(shouldUseReasoningEffort({ model, settings })).toBe(true)
 	})
 
@@ -669,9 +745,9 @@ describe("shouldUseReasoningEffort", () => {
 		const model: ModelInfo = {
 			contextWindow: 100_000,
 			supportsPromptCache: true,
-			supportsReasoningEffort: ["none", "minimal", "low", "medium", "high"] as unknown as any,
+			supportsReasoningEffort: ["none", "minimal", "low", "medium", "high"],
 		}
-		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "minimal" as any }
+		const settings: ProviderSettings = { enableReasoningEffort: true, reasoningEffort: "minimal" }
 		expect(shouldUseReasoningEffort({ model, settings })).toBe(true)
 	})
 
@@ -681,7 +757,53 @@ describe("shouldUseReasoningEffort", () => {
 			supportsPromptCache: true,
 			supportsReasoningEffort: true,
 		}
-		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: "none" as any } })).toBe(true)
-		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: "minimal" as any } })).toBe(true)
+		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: "none" } })).toBe(true)
+		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: "minimal" } })).toBe(true)
+	})
+
+	test("array capability with model default effort and no settings -> true when default is in the ladder", () => {
+		const model: ModelInfo = {
+			contextWindow: 1_000_000,
+			supportsPromptCache: true,
+			supportsReasoningEffort: ["low", "high", "max"],
+			reasoningEffort: "high",
+		}
+
+		expect(shouldUseReasoningEffort({ model })).toBe(true)
+		expect(shouldUseReasoningEffort({ model, settings: {} })).toBe(true)
+		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: undefined } })).toBe(true)
+	})
+
+	test("array capability with model default effort returns false when enableReasoningEffort is false", () => {
+		const model: ModelInfo = {
+			contextWindow: 1_000_000,
+			supportsPromptCache: true,
+			supportsReasoningEffort: ["low", "high", "max"],
+			reasoningEffort: "high",
+		}
+
+		expect(shouldUseReasoningEffort({ model, settings: { enableReasoningEffort: false } })).toBe(false)
+		expect(
+			shouldUseReasoningEffort({ model, settings: { enableReasoningEffort: false, reasoningEffort: "high" } }),
+		).toBe(false)
+	})
+
+	test("array capability with a user-selected effort outside the ladder -> false", () => {
+		const model: ModelInfo = {
+			contextWindow: 1_000_000,
+			supportsPromptCache: true,
+			supportsReasoningEffort: ["low", "high", "max"],
+			reasoningEffort: "high",
+		}
+
+		// The selection wins over the model default, but "medium" is not in the K3
+		// ladder, so reasoning must be omitted rather than sent as an unsupported effort.
+		expect(shouldUseReasoningEffort({ model, settings: { reasoningEffort: "medium" } })).toBe(false)
+		expect(
+			shouldUseReasoningEffort({
+				model,
+				settings: { enableReasoningEffort: true, reasoningEffort: "medium" },
+			}),
+		).toBe(false)
 	})
 })

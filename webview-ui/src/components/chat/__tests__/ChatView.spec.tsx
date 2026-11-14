@@ -6,6 +6,7 @@ import {
 	mockVscodePostMessage,
 	renderWithExtensionState,
 	waitFor,
+	screen,
 	act,
 	fireEvent,
 } from "@/utils/test-utils"
@@ -49,24 +50,30 @@ vi.mock("use-sound", () => ({
 	}),
 }))
 
+let nextRowInstance = 0
+
 // Mock components that use ESM dependencies
 vi.mock("../ChatRow", () => ({
 	default: function MockChatRow({
 		message,
 		onSuggestionClick,
+		isFollowUpAnswered,
 	}: {
 		message: ClineMessage
 		onSuggestionClick?: (suggestion: SuggestionItem, event?: React.MouseEvent) => void
+		isFollowUpAnswered?: boolean
 	}) {
+		const [instance] = React.useState(() => ++nextRowInstance)
 		if (message.type === "ask" && message.ask === "followup" && message.text) {
 			try {
 				const followUp = JSON.parse(message.text) as { suggest?: SuggestionItem[] }
 				return (
-					<div data-testid="chat-row">
+					<div data-testid="chat-row" data-answered={isFollowUpAnswered === true ? "true" : "false"}>
 						{followUp.suggest?.map((suggestion) => (
 							<button
 								key={suggestion.answer}
 								type="button"
+								data-testid="followup-suggestion"
 								onClick={(event) => onSuggestionClick?.(suggestion, event)}>
 								{suggestion.answer}
 							</button>
@@ -78,7 +85,11 @@ vi.mock("../ChatRow", () => ({
 			}
 		}
 
-		return <div data-testid="chat-row">{JSON.stringify(message)}</div>
+		return (
+			<div data-testid="chat-row" data-instance={instance}>
+				{JSON.stringify(message)}
+			</div>
+		)
 	},
 }))
 
@@ -211,8 +222,8 @@ vi.mock("../common/TelemetryBanner", () => ({
 }))
 
 // Mock i18n
-vi.mock("react-i18next", () => ({
-	useTranslation: () => ({
+vi.mock("@src/i18n/TranslationContext", () => ({
+	useAppTranslation: () => ({
 		t: (key: string, options?: any) => {
 			if (key === "chat:versionIndicator.ariaLabel" && options?.version) {
 				return `Version ${options.version}`
@@ -220,10 +231,9 @@ vi.mock("react-i18next", () => ({
 			return key
 		},
 	}),
-	initReactI18next: {
-		type: "3rdParty",
-		init: () => {},
-	},
+}))
+
+vi.mock("react-i18next", () => ({
 	Trans: ({ i18nKey, children }: { i18nKey: string; children?: React.ReactNode }) => {
 		return <>{children || i18nKey}</>
 	},
@@ -460,6 +470,45 @@ describe("ChatView - Tool Batching Tests", () => {
 			expect(toolRow?.text).toContain('"path":"b.ts"')
 		})
 	})
+
+	it("shows a repeated assistant preamble once while batching readFile asks", async () => {
+		renderChatView()
+		const preamble = "I'll read the files now."
+
+		mockPostMessage({
+			clineMessages: [
+				{ type: "say", say: "task", ts: 1, text: "Read the relevant files." },
+				{ type: "say", say: "text", ts: 2, text: preamble },
+				{
+					type: "ask",
+					ask: "tool",
+					ts: 3,
+					text: JSON.stringify({ tool: "readFile", path: "a.ts" }),
+				},
+				{ type: "say", say: "text", ts: 4, text: preamble },
+				{
+					type: "ask",
+					ask: "tool",
+					ts: 5,
+					text: JSON.stringify({ tool: "readFile", path: "b.ts" }),
+				},
+			],
+		})
+
+		await waitFor(() => {
+			const textRows = mockVirtuosoState.lastData.filter(
+				(message) => message.type === "say" && message.say === "text" && message.text === preamble,
+			)
+			const toolRows = mockVirtuosoState.lastData.filter(
+				(message) => message.type === "ask" && message.ask === "tool",
+			)
+
+			expect(textRows).toHaveLength(1)
+			expect(toolRows).toHaveLength(1)
+			const toolPayload = JSON.parse(toolRows[0]?.text ?? "{}") as { batchFiles?: Array<{ path?: string }> }
+			expect(toolPayload.batchFiles?.map(({ path }) => path)).toEqual(["a.ts", "b.ts"])
+		})
+	})
 })
 
 describe("ChatView - Aggregated Costs Lifecycle", () => {
@@ -679,6 +728,22 @@ describe("ChatView - Virtualization Configuration", () => {
 		mockVirtuosoState.lastConfig = null
 	})
 
+	it("preserves the row instance when a partial message completes", async () => {
+		renderChatView()
+		const task: ClineMessage = { type: "say", say: "task", ts: 1, text: "Task" }
+		const partial: ClineMessage = { type: "say", say: "text", ts: 2, text: "Streaming", partial: true }
+		mockPostMessage({ clineMessages: [task, partial] })
+		const row = await screen.findByTestId("chat-row")
+		const instance = row.getAttribute("data-instance")
+		expect(instance).not.toBeNull()
+		await dispatchExtensionMessage({
+			type: "messageUpdated",
+			clineMessage: { ...partial, text: "Completed", partial: false },
+		})
+		await waitFor(() => expect(screen.getByTestId("chat-row")).toHaveTextContent("Completed"))
+		expect(screen.getByTestId("chat-row").getAttribute("data-instance")).toBe(instance)
+	})
+
 	it("keeps the off-screen render buffer tight for chat rows", async () => {
 		renderChatView()
 
@@ -709,11 +774,90 @@ describe("ChatView - Virtualization Configuration", () => {
 		expect(mockVirtuosoState.lastConfig?.defaultItemHeight).toBe(180)
 		expect(mockVirtuosoState.lastConfig?.increaseViewportBy).toEqual({ top: 600, bottom: 800 })
 		expect(mockVirtuosoState.lastConfig?.computeItemKey?.(1, { type: "say", ts: rowTs })).toBe(`${rowTs}-1`)
+		expect(mockVirtuosoState.lastConfig?.computeItemKey?.(1, { type: "say", ts: rowTs, partial: true })).toBe(
+			`${rowTs}-1`,
+		)
 	})
 })
 
 describe("ChatView - Focus Grabbing Tests", () => {
-	beforeEach(() => vi.clearAllMocks())
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.spyOn(document, "hasFocus").mockReturnValue(false)
+	})
+
+	afterEach(() => vi.mocked(document.hasFocus).mockRestore())
+
+	it("does not focus input when mounted or shown while this document is unfocused", async () => {
+		vi.useFakeTimers()
+		try {
+			const { rerender } = renderChatView()
+			await act(async () => vi.advanceTimersByTime(100))
+			expect(mockFocus).not.toHaveBeenCalled()
+			rerender(<ChatView {...defaultProps} isHidden={true} />)
+			rerender(<ChatView {...defaultProps} isHidden={false} />)
+			await act(async () => vi.advanceTimersByTime(100))
+			expect(mockFocus).not.toHaveBeenCalled()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it("does not focus input on passive visibility notifications but preserves explicit focus requests", async () => {
+		renderChatView()
+		mockFocus.mockClear()
+		await dispatchExtensionMessage({ type: "action", action: "didBecomeVisible" })
+		expect(mockFocus).not.toHaveBeenCalled()
+		await dispatchExtensionMessage({ type: "action", action: "focusInput" })
+		expect(mockFocus).toHaveBeenCalledTimes(1)
+	})
+
+	it("autofocuses input when the user opens a focused chat", async () => {
+		vi.mocked(document.hasFocus).mockReturnValue(true)
+		vi.useFakeTimers()
+		try {
+			renderChatView()
+			await act(async () => vi.advanceTimersByTime(100))
+			expect(mockFocus).toHaveBeenCalledTimes(1)
+			mockFocus.mockClear()
+			await dispatchExtensionMessage({ type: "action", action: "didBecomeVisible" })
+			expect(mockFocus).toHaveBeenCalledTimes(1)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it("does not run delayed autofocus after focus moves back to the editor", async () => {
+		vi.mocked(document.hasFocus).mockReturnValue(true)
+		vi.useFakeTimers()
+		try {
+			renderChatView()
+			vi.mocked(document.hasFocus).mockReturnValue(false)
+			await act(async () => vi.advanceTimersByTime(100))
+			expect(mockFocus).not.toHaveBeenCalled()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it.each([false, true])("only refocuses re-enabled input when this document has focus=%s", async (hasFocus) => {
+		vi.mocked(document.hasFocus).mockReturnValue(hasFocus)
+		vi.useFakeTimers()
+		try {
+			const { getByRole } = renderChatView()
+			await dispatchTaskState("background task", 1)
+			await dispatchExtensionMessage({ type: "invoke", invoke: "newChat" })
+			expect(getByRole("textbox")).toHaveAttribute("data-sending-disabled", "true")
+			await act(async () => vi.advanceTimersByTime(100))
+			mockFocus.mockClear()
+			await dispatchExtensionMessage({ type: "state", state: makeExtensionState({ clineMessages: [] }) })
+			expect(getByRole("textbox")).toHaveAttribute("data-sending-disabled", "false")
+			await act(async () => vi.advanceTimersByTime(100))
+			expect(mockFocus).toHaveBeenCalledTimes(hasFocus ? 1 : 0)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
 
 	it("does not grab focus when follow-up question presented", async () => {
 		const { getByTestId } = renderChatView()
@@ -733,11 +877,6 @@ describe("ChatView - Focus Grabbing Tests", () => {
 		// Wait for the component to fully render and settle before clearing mocks
 		await waitFor(() => {
 			expect(getByTestId("chat-textarea")).toBeInTheDocument()
-		})
-
-		// Wait for the debounced focus effect to fire (50ms debounce + buffer for CI variability)
-		await act(async () => {
-			await new Promise((resolve) => setTimeout(resolve, 100))
 		})
 
 		// Clear any initial calls after state has settled
@@ -1459,6 +1598,158 @@ describe("ChatView - Follow-up Suggestions", () => {
 			})
 		})
 		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "mode" }))
+	})
+
+	it("ignores a blank or missing suggestion answer instead of crashing (issue #1226)", async () => {
+		const { getAllByTestId } = renderChatView()
+
+		// JSON.stringify drops `answer: undefined`, mirroring how the extension
+		// delivers a malformed follow-up suggestion (no `answer` property).
+		mockPostMessage({
+			mode: "ask",
+			customModes: [],
+			clineMessages: [
+				{
+					type: "say",
+					say: "task",
+					ts: Date.now() - 1000,
+					text: "Initial task",
+				},
+				{
+					type: "ask",
+					ask: "followup",
+					ts: Date.now(),
+					text: JSON.stringify({
+						question: "Pick one?",
+						suggest: [{ answer: undefined }, { answer: "Valid answer" }],
+					}),
+					partial: false,
+				},
+			],
+		})
+
+		const suggestionButtons = await waitFor(() => {
+			const buttons = getAllByTestId("followup-suggestion")
+			if (buttons.length !== 2) {
+				throw new Error(`expected 2 suggestion buttons, got ${buttons.length}`)
+			}
+			return buttons
+		})
+		vscodePostMessageMock.cleanup()
+
+		// Clicking the blank suggestion must be ignored: no response is sent and
+		// no undefined value is pushed into the input state.
+		fireEvent.click(suggestionButtons[0])
+
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "askResponse" }))
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "mode" }))
+		// The ignored click must not mark the follow-up as answered either.
+		expect(suggestionButtons[0].closest('[data-testid="chat-row"]')?.getAttribute("data-answered")).toBe("false")
+
+		// The valid suggestion still sends its answer.
+		fireEvent.click(suggestionButtons[1])
+
+		await waitFor(() => {
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "askResponse",
+				askResponse: "messageResponse",
+				text: "Valid answer",
+				images: [],
+			})
+		})
+	})
+
+	it("appends a valid suggestion to the input on shift-click without sending it (issue #1226)", async () => {
+		const { getByTestId, getByRole } = renderChatView()
+
+		mockPostMessage({
+			mode: "ask",
+			customModes: [],
+			clineMessages: [
+				{
+					type: "say",
+					say: "task",
+					ts: Date.now() - 1000,
+					text: "Initial task",
+				},
+				{
+					type: "ask",
+					ask: "followup",
+					ts: Date.now(),
+					text: JSON.stringify({
+						question: "Pick one?",
+						suggest: [{ answer: undefined }, { answer: "Copy me" }],
+					}),
+					partial: false,
+				},
+			],
+		})
+
+		const suggestion = await waitFor(() => getByRole("button", { name: "Copy me" }))
+		vscodePostMessageMock.cleanup()
+
+		// Pre-fill the draft, then shift-click ("Copy to input") the valid suggestion.
+		const input = getByTestId("chat-textarea").querySelector("input")
+		if (!input) {
+			throw new Error("expected the chat input to be rendered")
+		}
+
+		fireEvent.change(input, { target: { value: "Draft text" } })
+
+		fireEvent.click(suggestion, { shiftKey: true })
+
+		// The answer is appended to the existing draft instead of being sent.
+		// JSDOM strips line breaks from <input> values (HTML spec "strip newlines"),
+		// so the appended "\n" is absent from the DOM value.
+		await waitFor(() => expect(input.value).toBe("Draft text Copy me"))
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "askResponse" }))
+
+		// With an empty draft the answer is set as-is (no dangling "\n" prefix).
+		fireEvent.change(input, { target: { value: "" } })
+		fireEvent.click(suggestion, { shiftKey: true })
+		await waitFor(() => expect(input.value).toBe("Copy me"))
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "askResponse" }))
+	})
+
+	it("trims a padded suggestion answer before appending it on shift-click (issue #1226)", async () => {
+		const { getByTestId, getByRole } = renderChatView()
+
+		mockPostMessage({
+			mode: "ask",
+			customModes: [],
+			clineMessages: [
+				{
+					type: "say",
+					say: "task",
+					ts: Date.now() - 1000,
+					text: "Initial task",
+				},
+				{
+					type: "ask",
+					ask: "followup",
+					ts: Date.now(),
+					text: JSON.stringify({
+						question: "Pick one?",
+						suggest: [{ answer: "  Padded  " }],
+					}),
+					partial: false,
+				},
+			],
+		})
+
+		const suggestion = await waitFor(() => getByRole("button", { name: "Padded" }))
+		vscodePostMessageMock.cleanup()
+
+		const input = getByTestId("chat-textarea").querySelector("input")
+		if (!input) {
+			throw new Error("expected the chat input to be rendered")
+		}
+
+		// The padded answer reaches the input trimmed (issue #1226).
+		fireEvent.click(suggestion, { shiftKey: true })
+
+		await waitFor(() => expect(input.value).toBe("Padded"))
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "askResponse" }))
 	})
 })
 

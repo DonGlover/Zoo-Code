@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query"
+import { replaceEqualDeep, useQuery } from "@tanstack/react-query"
 
 import {
 	allRouterModelsProvider,
@@ -14,12 +14,19 @@ type UseRouterModelsOptions = {
 	enabled?: boolean // gate fetching entirely
 }
 
-export const fetchRouterModels = async (provider?: string) =>
+export const fetchRouterModels = async (provider?: string, signal?: AbortSignal) =>
 	new Promise<RouterModels>((resolve, reject) => {
 		const cleanup = () => {
+			signal?.removeEventListener("abort", onAbort)
 			if (typeof window !== "undefined") {
 				window.removeEventListener("message", handler)
 			}
+		}
+
+		const onAbort = () => {
+			clearTimeout(timeout)
+			cleanup()
+			reject(new DOMException("Router models request aborted", "AbortError"))
 		}
 
 		const timeout = setTimeout(() => {
@@ -50,6 +57,12 @@ export const fetchRouterModels = async (provider?: string) =>
 			}
 		}
 
+		if (signal?.aborted) {
+			onAbort()
+			return
+		}
+
+		signal?.addEventListener("abort", onAbort, { once: true })
 		window.addEventListener("message", handler)
 		if (provider) {
 			vscode.postMessage({ type: RouterModelsMessageType.requestRouterModels, values: { provider } })
@@ -62,7 +75,18 @@ export const useRouterModels = (opts: UseRouterModelsOptions = {}) => {
 	const provider = opts.provider || undefined
 	return useQuery({
 		queryKey: [RouterModelsMessageType.routerModels, provider || allRouterModelsProvider],
-		queryFn: () => fetchRouterModels(provider),
+		queryFn: ({ signal }) => fetchRouterModels(provider, signal),
 		enabled: opts.enabled !== false,
+		// Structural sharing copies into `{}`, where an own "__proto__" model ID would swap the
+		// copy's prototype instead of becoming a key, so skip sharing for such catalogs.
+		structuralSharing: (oldData, newData) =>
+			hasOwnProtoModelId(newData) ? newData : replaceEqualDeep(oldData, newData),
 	})
 }
+
+const hasOwnProtoModelId = (data: unknown): boolean =>
+	typeof data === "object" &&
+	data !== null &&
+	Object.values(data).some(
+		(models) => typeof models === "object" && models !== null && Object.hasOwn(models, "__proto__"),
+	)

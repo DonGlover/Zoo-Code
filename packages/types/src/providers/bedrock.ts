@@ -1,4 +1,13 @@
-import type { ModelInfo } from "../model.js"
+import { z } from "zod"
+
+import { type ModelInfo } from "../model.js"
+import { providerIdentifiers } from "../provider-identifiers.js"
+import {
+	API_MODEL_ID_FIELD,
+	apiModelIdProviderModelShape,
+	createModelIdAccessor,
+	createProviderDefinition,
+} from "./common.js"
 
 // https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
 
@@ -14,7 +23,7 @@ export const bedrockDefaultPromptRouterModelId: BedrockModelId = "anthropic.clau
 // feature.
 export const bedrockModels = {
 	"anthropic.claude-sonnet-4-5-20250929-v1:0": {
-		maxTokens: 8192,
+		maxTokens: 64_000,
 		contextWindow: 200_000,
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -22,13 +31,14 @@ export const bedrockModels = {
 		inputPrice: 3.0,
 		outputPrice: 15.0,
 		cacheWritesPrice: 3.75,
+		cacheWritesPrice1h: 6, // $6.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.3,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
 		cachableFields: ["system", "messages", "tools"],
 	},
 	"anthropic.claude-sonnet-4-6": {
-		maxTokens: 8192,
+		maxTokens: 64_000,
 		contextWindow: 200_000, // Default 200K, extendable to 1M with beta flag 'context-1m-2025-08-07'
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -36,6 +46,7 @@ export const bedrockModels = {
 		inputPrice: 3.0, // $3 per million input tokens (≤200K context)
 		outputPrice: 15.0, // $15 per million output tokens (≤200K context)
 		cacheWritesPrice: 3.75, // $3.75 per million tokens
+		cacheWritesPrice1h: 6, // $6.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.3, // $0.30 per million tokens
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -47,12 +58,14 @@ export const bedrockModels = {
 				inputPrice: 6.0, // $6 per million input tokens (>200K context)
 				outputPrice: 22.5, // $22.50 per million output tokens (>200K context)
 				cacheWritesPrice: 7.5, // $7.50 per million tokens (>200K context)
+				cacheWritesPrice1h: 12, // $12.00 per million tokens (2x tier input price, 1h cache writes)
 				cacheReadsPrice: 0.6, // $0.60 per million tokens (>200K context)
 			},
 		],
 	},
 	"anthropic.claude-sonnet-5": {
-		maxTokens: 8192,
+		maxTokens: 128_000,
+		supportsMaxTokens: true,
 		contextWindow: 1_000_000, // 1M context window native (no beta header required)
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -62,6 +75,7 @@ export const bedrockModels = {
 		inputPrice: 2.0, // $2 per million input tokens (introductory pricing through Aug 31, 2026)
 		outputPrice: 10.0, // $10 per million output tokens (introductory pricing through Aug 31, 2026)
 		cacheWritesPrice: 2.5, // $2.50 per million tokens (introductory pricing through Aug 31, 2026)
+		cacheWritesPrice1h: 4, // $4.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.2, // $0.20 per million tokens (introductory pricing through Aug 31, 2026)
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -142,6 +156,7 @@ export const bedrockModels = {
 		inputPrice: 3.0,
 		outputPrice: 15.0,
 		cacheWritesPrice: 3.75,
+		cacheWritesPrice1h: 6, // $6.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.3,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -156,6 +171,7 @@ export const bedrockModels = {
 		inputPrice: 15.0,
 		outputPrice: 75.0,
 		cacheWritesPrice: 18.75,
+		cacheWritesPrice1h: 30, // $30.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 1.5,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -170,6 +186,7 @@ export const bedrockModels = {
 		inputPrice: 5.0, // $5 per million input tokens (≤200K context)
 		outputPrice: 25.0, // $25 per million output tokens (≤200K context)
 		cacheWritesPrice: 6.25, // $6.25 per million tokens
+		cacheWritesPrice1h: 10, // $10.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.5, // $0.50 per million tokens
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -181,12 +198,13 @@ export const bedrockModels = {
 				inputPrice: 10.0, // $10 per million input tokens (>200K context)
 				outputPrice: 37.5, // $37.50 per million output tokens (>200K context)
 				cacheWritesPrice: 12.5, // $12.50 per million tokens (>200K context)
+				cacheWritesPrice1h: 20, // $20.00 per million tokens (2x tier input price, 1h cache writes)
 				cacheReadsPrice: 1.0, // $1.00 per million tokens (>200K context)
 			},
 		],
 	},
 	"anthropic.claude-opus-4-7": {
-		maxTokens: 8192,
+		maxTokens: 128_000,
 		contextWindow: 200_000, // Default 200K, extendable to 1M with beta flag 'context-1m-2025-08-07'
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -194,6 +212,7 @@ export const bedrockModels = {
 		inputPrice: 5.0, // $5 per million input tokens (≤200K context) — verify against Bedrock console
 		outputPrice: 25.0, // $25 per million output tokens (≤200K context) — verify against Bedrock console
 		cacheWritesPrice: 6.25, // $6.25 per million tokens
+		cacheWritesPrice1h: 10, // $10.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.5, // $0.50 per million tokens
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -205,12 +224,13 @@ export const bedrockModels = {
 				inputPrice: 10.0, // $10 per million input tokens (>200K context)
 				outputPrice: 37.5, // $37.50 per million output tokens (>200K context)
 				cacheWritesPrice: 12.5, // $12.50 per million tokens (>200K context)
+				cacheWritesPrice1h: 20, // $20.00 per million tokens (2x tier input price, 1h cache writes)
 				cacheReadsPrice: 1.0, // $1.00 per million tokens (>200K context)
 			},
 		],
 	},
 	"anthropic.claude-opus-4-8": {
-		maxTokens: 8192,
+		maxTokens: 128_000,
 		contextWindow: 200_000, // Default 200K, extendable to 1M with beta flag 'context-1m-2025-08-07'
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -218,6 +238,7 @@ export const bedrockModels = {
 		inputPrice: 5.0, // $5 per million input tokens (≤200K context) — verify against Bedrock console
 		outputPrice: 25.0, // $25 per million output tokens (≤200K context) — verify against Bedrock console
 		cacheWritesPrice: 6.25, // $6.25 per million tokens
+		cacheWritesPrice1h: 10, // $10.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.5, // $0.50 per million tokens
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -231,12 +252,14 @@ export const bedrockModels = {
 				inputPrice: 10.0, // $10 per million input tokens (>200K context)
 				outputPrice: 37.5, // $37.50 per million output tokens (>200K context)
 				cacheWritesPrice: 12.5, // $12.50 per million tokens (>200K context)
+				cacheWritesPrice1h: 20, // $20.00 per million tokens (2x tier input price, 1h cache writes)
 				cacheReadsPrice: 1.0, // $1.00 per million tokens (>200K context)
 			},
 		],
 	},
 	"anthropic.claude-opus-5": {
-		maxTokens: 8192,
+		maxTokens: 128_000,
+		supportsMaxTokens: true,
 		contextWindow: 1_000_000, // 1M context window native (no beta header required)
 		supportsImages: true,
 		supportsPromptCache: true,
@@ -246,11 +269,85 @@ export const bedrockModels = {
 		inputPrice: 5.0, // $5 per million input tokens
 		outputPrice: 25.0, // $25 per million output tokens
 		cacheWritesPrice: 6.25, // $6.25 per million tokens
+		cacheWritesPrice1h: 10, // $10.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.5, // $0.50 per million tokens
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
 		cachableFields: ["system", "messages", "tools"],
 		description: "Claude Opus 5 is Anthropic's most capable model for complex agentic coding and enterprise work.",
+	},
+	"anthropic.claude-opus-5-5": {
+		// 128K max output tokens per the AWS Bedrock model card:
+		// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5-5.html
+		maxTokens: 128_000,
+		supportsMaxTokens: true,
+		contextWindow: 1_000_000, // 1M context window native (no beta header required)
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningBudget: true,
+		supportsReasoningBinary: true,
+		supportsTemperature: false,
+		inputPrice: 4.0, // $4 per million input tokens
+		outputPrice: 20.0, // $20 per million output tokens
+		cacheWritesPrice: 5.0, // $5 per million tokens
+		cacheWritesPrice1h: 8, // $8.00 per million tokens (2x input price, 1h cache writes)
+		cacheReadsPrice: 0.2, // $0.20 per million tokens
+		// The same Bedrock model card lists 512 as the minimum tokens per cache
+		// checkpoint for Opus 5.5 (matching the Fable 5.1 entry below).
+		minTokensPerCachePoint: 512,
+		maxCachePoints: 4,
+		cachableFields: ["system", "messages", "tools"],
+		description:
+			"Claude Opus 5.5 is Anthropic's most capable model for complex agentic coding and enterprise work.",
+	},
+	"anthropic.claude-haiku-5-5": {
+		// 128K max output tokens, 1M native context window, 512-token minimum per
+		// cache checkpoint, and 4 max cache checkpoints per the AWS Bedrock model card:
+		// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
+		maxTokens: 128_000,
+		supportsMaxTokens: true,
+		contextWindow: 1_000_000, // 1M context window native (no beta header required)
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningBudget: true,
+		supportsReasoningBinary: true,
+		supportsTemperature: false,
+		// Standard pricing (prompts of 100,000 tokens or fewer) from Anthropic's
+		// pricing page, which lists the same Claude list prices billed on Bedrock:
+		// https://platform.claude.com/docs/en/about-claude/pricing
+		// These fields price the standard tier only. This entry does not model
+		// the tiered long-context rates that prompts over 100,000 tokens bill at.
+		inputPrice: 0.1, // $0.10 per million input tokens
+		outputPrice: 0.5, // $0.50 per million output tokens
+		cacheWritesPrice: 0.125, // $0.125 per million tokens (5m cache writes)
+		cacheWritesPrice1h: 0.2, // $0.20 per million tokens (2x input price, 1h cache writes)
+		cacheReadsPrice: 0.01, // $0.01 per million tokens (cache hits / refreshes)
+		// The same Bedrock model card lists 512 as the minimum tokens per cache
+		// checkpoint for Haiku 5.5 (matching the Opus 5.5 entry above).
+		minTokensPerCachePoint: 512,
+		maxCachePoints: 4,
+		cachableFields: ["system", "messages", "tools"],
+		description:
+			"Claude Haiku 5.5 is the fastest, most efficient Claude 5.5 model, built for high-volume, latency-sensitive coding and agent work.",
+	},
+	"anthropic.claude-fable-5-1": {
+		maxTokens: 128_000,
+		contextWindow: 1_000_000,
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningBudget: true,
+		supportsReasoningBinary: true,
+		supportsTemperature: false,
+		inputPrice: 10.0,
+		outputPrice: 50.0,
+		cacheWritesPrice: 12.5,
+		cacheWritesPrice1h: 20, // $20.00 per million tokens (2x input price, 1h cache writes)
+		cacheReadsPrice: 0.25,
+		minTokensPerCachePoint: 512,
+		maxCachePoints: 4,
+		cachableFields: ["system", "messages", "tools"],
+		description:
+			"Claude Fable 5.1 extends Fable 5 with stronger long-running agentic coding, multistep research, and document work.",
 	},
 	"anthropic.claude-fable-5": {
 		maxTokens: 8192,
@@ -263,6 +360,7 @@ export const bedrockModels = {
 		inputPrice: 10.0,
 		outputPrice: 50.0,
 		cacheWritesPrice: 12.5,
+		cacheWritesPrice1h: 20, // $20.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 1.0,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -279,6 +377,7 @@ export const bedrockModels = {
 		inputPrice: 5.0,
 		outputPrice: 25.0,
 		cacheWritesPrice: 6.25,
+		cacheWritesPrice1h: 10, // $10.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.5,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -293,6 +392,7 @@ export const bedrockModels = {
 		inputPrice: 15.0,
 		outputPrice: 75.0,
 		cacheWritesPrice: 18.75,
+		cacheWritesPrice1h: 30, // $30.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 1.5,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -307,6 +407,7 @@ export const bedrockModels = {
 		inputPrice: 3.0,
 		outputPrice: 15.0,
 		cacheWritesPrice: 3.75,
+		cacheWritesPrice1h: 6, // $6.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.3,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -320,6 +421,7 @@ export const bedrockModels = {
 		inputPrice: 3.0,
 		outputPrice: 15.0,
 		cacheWritesPrice: 3.75,
+		cacheWritesPrice1h: 6, // $6.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.3,
 		minTokensPerCachePoint: 1024,
 		maxCachePoints: 4,
@@ -333,6 +435,7 @@ export const bedrockModels = {
 		inputPrice: 0.8,
 		outputPrice: 4.0,
 		cacheWritesPrice: 1.0,
+		cacheWritesPrice1h: 1.6, // $1.60 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.08,
 		minTokensPerCachePoint: 2048,
 		maxCachePoints: 4,
@@ -347,6 +450,7 @@ export const bedrockModels = {
 		inputPrice: 1.0,
 		outputPrice: 5.0,
 		cacheWritesPrice: 1.25, // 5m cache writes
+		cacheWritesPrice1h: 2, // $2.00 per million tokens (2x input price, 1h cache writes)
 		cacheReadsPrice: 0.1, // cache hits / refreshes
 		minTokensPerCachePoint: 2048,
 		maxCachePoints: 4,
@@ -632,6 +736,23 @@ export const BEDROCK_1M_CONTEXT_MODEL_IDS = [
 	"anthropic.claude-opus-4-8",
 ] as const
 
+// Amazon Bedrock models whose adaptive thinking is on by default and must be
+// turned off with an explicit `thinking: { type: "disabled" }`. Adaptive-only
+// models (Fable 5/5.1, Opus 5.5) reject that field with a 400, so they are
+// intentionally absent.
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
+export const BEDROCK_THINKING_DISABLE_MODEL_IDS = [
+	"anthropic.claude-sonnet-5",
+	"anthropic.claude-opus-5",
+	// Unlike adaptive-only Opus 5.5, Haiku 5.5 accepts an explicit
+	// `thinking: { type: "disabled" }` and turns its default adaptive thinking
+	// off. AWS caps effort at "high" while thinking is disabled.
+	// https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+	"anthropic.claude-haiku-5-5",
+] as const
+
 // Amazon Bedrock models that support Global Inference profiles
 // As of Nov 2025, AWS supports Global Inference for:
 // - Claude Sonnet 4
@@ -643,7 +764,9 @@ export const BEDROCK_1M_CONTEXT_MODEL_IDS = [
 // - Claude Opus 4.6
 // - Claude Opus 4.7
 // - Claude Opus 5
-// - Claude Fable 5 (cross-region inference only — can only be used through an inference profile)
+// - Claude Opus 5.5
+// - Claude Haiku 5.5
+// - Claude Fable 5 and 5.1 (cross-region inference only — can only be used through an inference profile)
 export const BEDROCK_GLOBAL_INFERENCE_MODEL_IDS = [
 	"anthropic.claude-sonnet-4-20250514-v1:0",
 	"anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -655,6 +778,9 @@ export const BEDROCK_GLOBAL_INFERENCE_MODEL_IDS = [
 	"anthropic.claude-opus-4-7",
 	"anthropic.claude-opus-4-8",
 	"anthropic.claude-opus-5",
+	"anthropic.claude-opus-5-5",
+	"anthropic.claude-haiku-5-5",
+	"anthropic.claude-fable-5-1",
 	"anthropic.claude-fable-5",
 ] as const
 
@@ -685,3 +811,68 @@ export const BEDROCK_SERVICE_TIER_PRICING = {
 	FLEX: 0.5, // 50% discount from standard
 	PRIORITY: 1.75, // 75% premium over standard
 } as const
+
+const isBedrockModelId = (id: string): id is BedrockModelId => Object.prototype.hasOwnProperty.call(bedrockModels, id)
+
+/** Stored in `awsCustomArnBaseModelId` when the user explicitly chooses "Other" for a custom ARN. */
+export const BEDROCK_CUSTOM_ARN_OTHER_BASE_MODEL = "other"
+
+export const isBedrockFoundationModelArn = (arn: string | undefined): boolean =>
+	!!arn && /^arn:[^:]+:bedrock:[^:]+:[^:]*:foundation-model\//.test(arn)
+
+/**
+ * Resolves the registry model a custom ARN points to:
+ * - a foundation-model ARN always resolves to the model it names, because that model is invoked;
+ * - an explicit "Other" choice resolves to undefined, even when the ARN names a model;
+ * - otherwise the user's choice when it is a known model, then a model named at the end of the ARN
+ *   (e.g. `inference-profile/us.anthropic.claude-opus-4-8`).
+ * Returns undefined when the model is unknown (e.g. application inference profiles).
+ */
+export const resolveBedrockCustomArnBaseModelId = (
+	customArn: string | undefined,
+	baseModelId: string | undefined,
+): BedrockModelId | undefined => {
+	const namedModelId = customArn
+		? (Object.keys(bedrockModels) as BedrockModelId[]).find(
+				(id) => customArn.endsWith(`/${id}`) || customArn.endsWith(`.${id}`),
+			)
+		: undefined
+
+	if (isBedrockFoundationModelArn(customArn)) {
+		return namedModelId
+	}
+
+	if (baseModelId === BEDROCK_CUSTOM_ARN_OTHER_BASE_MODEL) {
+		return undefined
+	}
+
+	return baseModelId && isBedrockModelId(baseModelId) ? baseModelId : namedModelId
+}
+
+export const bedrockProviderDefinition = createProviderDefinition({
+	apiProvider: providerIdentifiers.bedrock,
+	modelIdKey: API_MODEL_ID_FIELD,
+	getModelId: createModelIdAccessor(API_MODEL_ID_FIELD),
+	getDefaultModelId: () => bedrockDefaultModelId,
+	schema: {
+		...apiModelIdProviderModelShape,
+		awsAccessKey: z.string().optional(),
+		awsSecretKey: z.string().optional(),
+		awsSessionToken: z.string().optional(),
+		awsRegion: z.string().optional(),
+		awsUseCrossRegionInference: z.boolean().optional(),
+		awsUseGlobalInference: z.boolean().optional(), // Enable Global Inference profile routing when supported
+		awsUsePromptCache: z.boolean().optional(),
+		awsProfile: z.string().optional(),
+		awsUseProfile: z.boolean().optional(),
+		awsApiKey: z.string().optional(),
+		awsUseApiKey: z.boolean().optional(),
+		awsCustomArn: z.string().optional(),
+		awsCustomArnBaseModelId: z.string().optional(), // Registry model a custom ARN points to; drives capabilities and pricing
+		awsModelContextWindow: z.number().optional(),
+		awsBedrockEndpointEnabled: z.boolean().optional(),
+		awsBedrockEndpoint: z.string().optional(),
+		awsBedrock1MContext: z.boolean().optional(), // Enable 'context-1m-2025-08-07' beta for 1M context window.
+		awsBedrockServiceTier: z.enum(["STANDARD", "FLEX", "PRIORITY"]).optional(), // AWS Bedrock service tier selection
+	},
+})

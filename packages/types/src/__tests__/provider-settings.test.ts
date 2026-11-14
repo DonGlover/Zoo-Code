@@ -2,12 +2,13 @@ import { ANTHROPIC_API_PROTOCOL, OPENAI_API_PROTOCOL, providerIdentifiers, provi
 import {
 	getApiProtocol,
 	OPEN_AI_CODEX_SERVICE_TIER_KEY,
+	parseOpenAiExtraBody,
 	PROVIDER_SETTINGS_KEYS,
 	providerSettingsSchema,
 	providerSettingsSchemaDiscriminated,
 } from "../provider-settings.js"
 import { OpenAiCodexServiceTier, OpenAiServiceTier } from "../model.js"
-import { providerDefinitionList } from "../provider-settings/index.js"
+import { providerDefinitionList } from "../providers/index.js"
 
 describe("provider settings discriminated union", () => {
 	it("composes exactly one provider-specific definition for every provider", () => {
@@ -17,8 +18,96 @@ describe("provider settings discriminated union", () => {
 		expect(new Set(registeredProviders).size).toBe(providerNames.length)
 	})
 
+	it.each(providerDefinitionList.map((definition) => definition.apiProvider))(
+		"exposes a default model accessor for %s",
+		(apiProvider) => {
+			const definition = providerDefinitionList.find((candidate) => candidate.apiProvider === apiProvider)
+
+			expect(typeof definition?.getDefaultModelId).toBe("function")
+			expect(typeof definition?.getDefaultModelId({})).toBe("string")
+		},
+	)
+
 	it.each(providerNames)("accepts the %s provider branch", (apiProvider) => {
 		expect(providerSettingsSchemaDiscriminated.safeParse({ apiProvider }).success).toBe(true)
+	})
+})
+
+describe("OpenAI-compatible extra body settings", () => {
+	it("accepts a JSON object with provider-specific nested fields", () => {
+		const settings = {
+			apiProvider: providerIdentifiers.openai,
+			openAiExtraBody: JSON.stringify({ metadata: { completion_window: "balanced" }, store: false }),
+		}
+
+		expect(providerSettingsSchemaDiscriminated.parse(settings)).toEqual(settings)
+		expect(PROVIDER_SETTINGS_KEYS).toContain("openAiExtraBody")
+	})
+
+	it.each(["not json", "[]", "null", '"value"'])("rejects non-object JSON: %s", (openAiExtraBody) => {
+		expect(
+			providerSettingsSchemaDiscriminated.safeParse({
+				apiProvider: providerIdentifiers.openai,
+				openAiExtraBody,
+			}).success,
+		).toBe(false)
+	})
+
+	it.each([
+		"__proto__",
+		"constructor",
+		"prototype",
+		"max_completion_tokens",
+		"max_tokens",
+		"messages",
+		"model",
+		"parallel_tool_calls",
+		"reasoning",
+		"reasoning_effort",
+		"response_format",
+		"stream",
+		"stream_options",
+		"temperature",
+		"tool_choice",
+		"tools",
+	])("rejects the reserved extra-body key %s", (reservedKey) => {
+		expect(
+			providerSettingsSchemaDiscriminated.safeParse({
+				apiProvider: providerIdentifiers.openai,
+				openAiExtraBody: JSON.stringify({ [reservedKey]: "override" }),
+			}).success,
+		).toBe(false)
+	})
+
+	it("reports and filters reserved keys while preserving allowed nested fields", () => {
+		const result = parseOpenAiExtraBody(
+			JSON.stringify({
+				metadata: { completion_window: "balanced" },
+				model: "overridden-model",
+				response_format: { type: "json_object" },
+				stream: false,
+			}),
+		)
+
+		expect(result).toEqual({
+			success: false,
+			reason: "reservedKeys",
+			reservedKeys: ["model", "response_format", "stream"],
+			data: { metadata: { completion_window: "balanced" } },
+		})
+	})
+
+	it("accepts stop and n as provider-specific request fields", () => {
+		const settings = {
+			apiProvider: providerIdentifiers.openai,
+			openAiExtraBody: JSON.stringify({ stop: ["DONE"], n: 2 }),
+		}
+
+		expect(providerSettingsSchemaDiscriminated.parse(settings)).toEqual(settings)
+		expect(parseOpenAiExtraBody(settings.openAiExtraBody)).toEqual({
+			success: true,
+			data: { stop: ["DONE"], n: 2 },
+		})
 	})
 })
 

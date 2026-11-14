@@ -43,13 +43,11 @@ Zoo Code 基于 Roo Code 打下的基础持续扩展，新增了：
 - **更可靠的终端和编辑工作流** — 修复终端过早完成、任务状态竞争、上下文管理、差异更新编辑和提供商专用工具调用等问题。
 - **更全面的工作区控制** — 支持规则管理、按模式限制 MCP、多根工作区路径控制、模型推理选项和完成后的变更审查操作。
 
-## v3.78.0 新增内容
+## v3.96.0 新增内容
 
-- **三款重磅新模型现已推出** — 使用全新的 Gemini 3.7 Flash、GLM 5.3 和 Qwen3.8 Max 模型，以及更新后的 DeepSeek V4 推理、定价和提供商覆盖。
-- **连接 NanoGPT** — 使用动态模型发现、流式传输和 Prompt 补全，并按速度、价格、延迟、吞吐量、工具支持和缓存设置路由偏好。
-- **更可靠的提供商和任务** — 修复改进了 Azure OpenAI endpoint 设置、Kimi Code 输出限制、任务历史标题保留以及 Zoo 设置的导入/导出。
-- Destructive Command Guard 现在支持基于 Intel 的 Mac。
-- 安全更新修复了 `undici` 和 Mermaid 中的漏洞。
+- ✨ **全新聊天设置与诊断:** 以可配置的时间与日期格式显示消息时间戳，为 Anthropic 配置文件调整 prompt-cache TTL，并生成注重隐私的诊断报告。
+- 💸 **更精准的供应商计费与缓存:** 保持 Anthropic 工具结果完整无损，在 Anthropic 和 MiniMax 成本中采用累计输出 token，读取 DeepSeek 的 prompt-cache 计数器，命中 xAI Responses 缓存，并按 0.1x 计收 Mistral 缓存读取费用。
+- 🧭 **更可靠、更快速的对话:** 重启后恢复已完成的任务，在已保存的 commit 缺失时仍能还原 checkpoint，自动重载无响应的 webview 渲染器，节流流式更新，并按需加载语言包。
 
 ## Zoo Code 能为您做什么？
 

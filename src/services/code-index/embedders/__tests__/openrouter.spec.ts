@@ -4,6 +4,7 @@ import { OpenAI } from "openai"
 import { OpenRouterEmbedder, OPENROUTER_DEFAULT_PROVIDER_NAME } from "../openrouter"
 import { getModelDimension, getDefaultModelId } from "../../../../shared/embeddingModels"
 import { clearAllMocks, restoreGlobals } from "../../../../test-utils/reset"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 // Mock the OpenAI SDK
 vi.mock("openai")
@@ -76,7 +77,6 @@ describe("OpenRouterEmbedder", () => {
 
 		it("should use default model when none specified", () => {
 			const embedder = new OpenRouterEmbedder(mockApiKey)
-			const expectedDefault = getDefaultModelId("openrouter")
 			expect(embedder.embedderInfo.name).toBe("openrouter")
 		})
 
@@ -340,7 +340,7 @@ describe("OpenRouterEmbedder", () => {
 		})
 
 		it("should validate configuration with specificProvider", async () => {
-			const specificProvider = "openai"
+			const specificProvider = providerIdentifiers.openai
 			const embedderWithProvider = new OpenRouterEmbedder(mockApiKey, undefined, undefined, specificProvider)
 
 			const testEmbedding = new Float32Array([0.25, 0.5])

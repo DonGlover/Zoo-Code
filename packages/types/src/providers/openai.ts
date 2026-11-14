@@ -1,6 +1,13 @@
 import { z } from "zod"
 
-import type { ModelInfo } from "../model.js"
+import { modelInfoSchema, type ModelInfo } from "../model.js"
+import { providerIdentifiers } from "../provider-identifiers.js"
+import {
+	baseProviderSettingsShape,
+	createModelIdAccessor,
+	createProviderDefinition,
+	NO_DEFAULT_MODEL_ID,
+} from "./common.js"
 
 // https://openai.com/api/pricing/
 export const openAiModelsMessageTypes = ["requestOpenAiModels", "openAiModels"] as const
@@ -17,6 +24,229 @@ export const OPENAI_API_PROTOCOL = "openai"
 export const openAiNativeDefaultModelId: OpenAiNativeModelId = "gpt-5.6-sol"
 
 export const openAiNativeModels = {
+	// https://developers.openai.com/api/docs/models/gpt-6.1-terra
+	"gpt-6.1-terra": {
+		maxTokens: 128000,
+		contextWindow: 1_050_000,
+		includedTools: ["apply_patch"],
+		excludedTools: ["apply_diff", "write_to_file"],
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
+		reasoningEffort: "medium",
+		inputPrice: 1,
+		outputPrice: 5,
+		cacheWritesPrice: 1.25,
+		cacheWritesPrice12h: 2.5,
+		cacheReadsPrice: 0.05,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
+		supportsVerbosity: true,
+		supportsTemperature: false,
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 0.5,
+				outputPrice: 2.5,
+				cacheWritesPrice: 0.625,
+				cacheReadsPrice: 0.025,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 2,
+				outputPrice: 10,
+				cacheWritesPrice: 2.5,
+				cacheReadsPrice: 0.1,
+			},
+		],
+		description: "GPT-6.1 Terra: Fast, efficient visual reasoning, precise computer use, and natural writing",
+	},
+	// https://developers.openai.com/api/docs/models/gpt-6.1-sol
+	"gpt-6.1-sol": {
+		maxTokens: 128000,
+		contextWindow: 1_050_000,
+		includedTools: ["apply_patch"],
+		excludedTools: ["apply_diff", "write_to_file"],
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["low", "medium", "high", "xhigh", "max"],
+		requiredReasoningEffort: true,
+		reasoningEffort: "medium",
+		inputPrice: 2.0,
+		outputPrice: 10.0,
+		cacheWritesPrice: 2.5,
+		cacheWritesPrice12h: 5, // $5.00 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.1,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
+		supportsVerbosity: true,
+		supportsTemperature: false,
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 1.0,
+				outputPrice: 5.0,
+				cacheWritesPrice: 1.25,
+				cacheReadsPrice: 0.05,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 4.0,
+				outputPrice: 20.0,
+				cacheWritesPrice: 5.0,
+				cacheReadsPrice: 0.2,
+			},
+		],
+		description: "GPT-6.1 Sol: Near-Astra performance for complex coding and professional work at a lower cost",
+	},
+	"gpt-6-astra": {
+		maxTokens: 128000,
+		contextWindow: 1_050_000,
+		includedTools: ["apply_patch"],
+		excludedTools: ["apply_diff", "write_to_file"],
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["low", "medium", "high", "xhigh", "max"],
+		requiredReasoningEffort: true,
+		reasoningEffort: "medium",
+		inputPrice: 10.0,
+		outputPrice: 50.0,
+		cacheWritesPrice: 12.5,
+		cacheWritesPrice12h: 25, // $25.00 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 1.0,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
+		supportsTemperature: false,
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 5.0,
+				outputPrice: 25.0,
+				cacheWritesPrice: 6.25,
+				cacheReadsPrice: 0.5,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 20.0,
+				outputPrice: 100.0,
+				cacheWritesPrice: 25.0,
+				cacheReadsPrice: 2.0,
+			},
+		],
+		description: "GPT-6 Astra: OpenAI's most capable model for complex reasoning and end-to-end agentic work",
+	},
+	"gpt-6-sol": {
+		maxTokens: 128000,
+		contextWindow: 1_050_000,
+		includedTools: ["apply_patch"],
+		excludedTools: ["apply_diff", "write_to_file"],
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
+		reasoningEffort: "medium",
+		inputPrice: 2.0,
+		outputPrice: 10.0,
+		cacheWritesPrice: 2.5,
+		cacheWritesPrice12h: 5, // $5.00 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.2,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
+		supportsVerbosity: true,
+		supportsTemperature: false,
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 1.0,
+				outputPrice: 5.0,
+				cacheWritesPrice: 1.25,
+				cacheReadsPrice: 0.1,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 4.0,
+				outputPrice: 20.0,
+				cacheWritesPrice: 5.0,
+				cacheReadsPrice: 0.4,
+			},
+		],
+		description: "GPT-6 Sol: OpenAI's cost-efficient frontier model for complex coding and agentic workflows",
+	},
+	"gpt-6-luna": {
+		maxTokens: 128000,
+		contextWindow: 1_050_000,
+		includedTools: ["apply_patch"],
+		excludedTools: ["apply_diff", "write_to_file"],
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
+		reasoningEffort: "medium",
+		inputPrice: 0.1,
+		outputPrice: 0.5,
+		cacheWritesPrice: 0.125,
+		cacheWritesPrice12h: 0.25, // $0.25 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.01,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
+		supportsVerbosity: true,
+		supportsTemperature: false,
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 0.05,
+				outputPrice: 0.25,
+				cacheWritesPrice: 0.0625,
+				cacheReadsPrice: 0.005,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 0.2,
+				outputPrice: 1.0,
+				cacheWritesPrice: 0.25,
+				cacheReadsPrice: 0.02,
+			},
+		],
+		description: "GPT-6 Luna: The fastest, most affordable member of the GPT-6 family",
+	},
 	"gpt-5.6-sol": {
 		maxTokens: 128000,
 		contextWindow: 1_050_000,
@@ -26,21 +256,38 @@ export const openAiNativeModels = {
 		supportsPromptCache: true,
 		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
 		reasoningEffort: "medium",
-		inputPrice: 5.0,
-		outputPrice: 30.0,
-		cacheWritesPrice: 6.25,
-		cacheReadsPrice: 0.5,
+		inputPrice: 4.0,
+		outputPrice: 20.0,
+		cacheWritesPrice: 5.0,
+		cacheWritesPrice12h: 10, // $10.00 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.4,
 		longContextPricing: {
 			thresholdTokens: 272_000,
 			inputPriceMultiplier: 2,
 			outputPriceMultiplier: 1.5,
-			appliesToServiceTiers: ["default", "flex"],
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
 		},
 		supportsVerbosity: true,
 		supportsTemperature: false,
 		tiers: [
-			{ name: "flex", contextWindow: 1_050_000, inputPrice: 2.5, outputPrice: 15.0, cacheReadsPrice: 0.25 },
-			{ name: "priority", contextWindow: 1_050_000, inputPrice: 12.5, outputPrice: 75.0, cacheReadsPrice: 1.25 },
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 2.0,
+				outputPrice: 10.0,
+				cacheWritesPrice: 2.5,
+				cacheReadsPrice: 0.2,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 8.0,
+				outputPrice: 40.0,
+				cacheWritesPrice: 10.0,
+				cacheReadsPrice: 0.8,
+			},
 		],
 		description: "GPT-5.6 Sol: OpenAI's flagship model for frontier reasoning, coding, and agentic workflows",
 	},
@@ -53,40 +300,83 @@ export const openAiNativeModels = {
 		supportsPromptCache: true,
 		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
 		reasoningEffort: "medium",
-		inputPrice: 2.5,
-		outputPrice: 15.0,
-		cacheWritesPrice: 3.125,
-		cacheReadsPrice: 0.25,
+		inputPrice: 2.0,
+		outputPrice: 12.0,
+		cacheWritesPrice: 2.5,
+		cacheWritesPrice12h: 5, // $5.00 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.2,
 		longContextPricing: {
 			thresholdTokens: 272_000,
 			inputPriceMultiplier: 2,
 			outputPriceMultiplier: 1.5,
-			appliesToServiceTiers: ["default", "flex"],
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
 		},
 		supportsVerbosity: true,
 		supportsTemperature: false,
 		tiers: [
-			{ name: "flex", contextWindow: 1_050_000, inputPrice: 1.25, outputPrice: 7.5, cacheReadsPrice: 0.125 },
-			{ name: "priority", contextWindow: 1_050_000, inputPrice: 6.25, outputPrice: 37.5, cacheReadsPrice: 0.625 },
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 1.0,
+				outputPrice: 6.0,
+				cacheWritesPrice: 1.25,
+				cacheReadsPrice: 0.1,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 4.0,
+				outputPrice: 24.0,
+				cacheWritesPrice: 5.0,
+				cacheReadsPrice: 0.4,
+			},
 		],
 		description: "GPT-5.6 Terra: Balanced everyday model with GPT-5.5-competitive performance at 2x lower cost",
 	},
 	"gpt-5.6-luna": {
 		maxTokens: 128000,
-		contextWindow: 400000,
+		contextWindow: 1_050_000,
 		includedTools: ["apply_patch"],
 		excludedTools: ["apply_diff", "write_to_file"],
 		supportsImages: true,
 		supportsPromptCache: true,
 		supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh", "max"],
 		reasoningEffort: "medium",
-		inputPrice: 1.0,
-		outputPrice: 6.0,
-		cacheWritesPrice: 1.25,
-		cacheReadsPrice: 0.1,
+		inputPrice: 0.2,
+		outputPrice: 1.2,
+		cacheWritesPrice: 0.25,
+		cacheWritesPrice12h: 0.5, // $0.50 per million tokens (2.5x input price, 12h cache writes)
+		cacheReadsPrice: 0.02,
+		longContextPricing: {
+			thresholdTokens: 272_000,
+			inputPriceMultiplier: 2,
+			outputPriceMultiplier: 1.5,
+			cacheWritesPriceMultiplier: 2,
+			cacheReadsPriceMultiplier: 2,
+			appliesToServiceTiers: ["default", "flex", "priority"],
+		},
 		supportsVerbosity: true,
 		supportsTemperature: false,
-		tiers: [{ name: "flex", contextWindow: 400000, inputPrice: 0.5, outputPrice: 3.0, cacheReadsPrice: 0.05 }],
+		tiers: [
+			{
+				name: "flex",
+				contextWindow: 1_050_000,
+				inputPrice: 0.1,
+				outputPrice: 0.6,
+				cacheWritesPrice: 0.125,
+				cacheReadsPrice: 0.01,
+			},
+			{
+				name: "priority",
+				contextWindow: 1_050_000,
+				inputPrice: 0.4,
+				outputPrice: 2.4,
+				cacheWritesPrice: 0.5,
+				cacheReadsPrice: 0.04,
+			},
+		],
 		description: "GPT-5.6 Luna: The fastest, most affordable member of the GPT-5.6 family",
 	},
 	"gpt-5.1-codex-max": {
@@ -699,10 +989,11 @@ export const openAiNativeModels = {
 	},
 } as const satisfies Record<string, ModelInfo>
 
+// `maxTokens` is intentionally omitted so that no max output token limit is sent to the
+// provider by default.
 export const openAiModelInfoSaneDefaults: ModelInfo = {
-	maxTokens: -1,
 	contextWindow: 128_000,
-	supportsImages: true,
+	supportsImages: false,
 	supportsPromptCache: false,
 	inputPrice: 0,
 	outputPrice: 0,
@@ -746,3 +1037,104 @@ export function isAzureOpenAiBaseUrl(baseUrl?: string, useAzure?: boolean): bool
 		return false
 	}
 }
+
+export const OPEN_AI_MODEL_ID_FIELD = "openAiModelId"
+
+/**
+ * Default for the OpenAI `openAiStrictToolSchemas` setting.
+ * When true (default), non-MCP tools are sent with strict: true and their
+ * schemas are normalized for OpenAI strict mode. Some OpenAI-compatible
+ * proxies reject strict: true; set this to false for those endpoints.
+ */
+export const DEFAULT_OPEN_AI_STRICT_TOOL_SCHEMAS = true
+
+const OPENAI_EXTRA_BODY_RESERVED_KEYS = [
+	// Prototype-pollution defenses; remaining keys are request-owned, including tool-call protocol controls.
+	"__proto__",
+	"constructor",
+	"prototype",
+	"max_completion_tokens",
+	"max_tokens",
+	"messages",
+	"model",
+	"parallel_tool_calls",
+	"reasoning",
+	"reasoning_effort",
+	"response_format",
+	"stream",
+	"stream_options",
+	"temperature",
+	"tool_choice",
+	"tools",
+] as const
+
+type OpenAiExtraBodyParseResult =
+	| { success: true; data: Record<string, unknown> }
+	| {
+			success: false
+			reason: "invalidJson" | "objectRequired" | "reservedKeys"
+			data: Record<string, unknown>
+			reservedKeys?: string[]
+	  }
+
+export function parseOpenAiExtraBody(value: string | undefined): OpenAiExtraBodyParseResult {
+	if (!value?.trim()) {
+		return { success: true, data: {} }
+	}
+
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(value)
+	} catch {
+		return { success: false, reason: "invalidJson", data: {} }
+	}
+
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { success: false, reason: "objectRequired", data: {} }
+	}
+
+	const entries = Object.entries(parsed)
+	const reservedKeys = entries
+		.map(([key]) => key)
+		.filter((key) => (OPENAI_EXTRA_BODY_RESERVED_KEYS as readonly string[]).includes(key))
+	const data = Object.fromEntries(entries.filter(([key]) => !reservedKeys.includes(key)))
+
+	if (reservedKeys.length > 0) {
+		return { success: false, reason: "reservedKeys", reservedKeys, data }
+	}
+
+	return { success: true, data }
+}
+
+const openAiExtraBodySchema = z
+	.string()
+	.superRefine((value, ctx) => {
+		const result = parseOpenAiExtraBody(value)
+		if (!result.success) {
+			ctx.addIssue({ code: "custom", message: result.reason })
+		}
+	})
+	.optional()
+
+export const openAiProviderDefinition = createProviderDefinition({
+	apiProvider: providerIdentifiers.openai,
+	modelIdKey: OPEN_AI_MODEL_ID_FIELD,
+	getModelId: createModelIdAccessor(OPEN_AI_MODEL_ID_FIELD),
+	// OpenAI-compatible endpoints are fully user-configured, so there is no default.
+	getDefaultModelId: () => NO_DEFAULT_MODEL_ID,
+	schema: {
+		...baseProviderSettingsShape,
+		openAiBaseUrl: z.string().optional(),
+		openAiApiKey: z.string().optional(),
+		openAiR1FormatEnabled: z.boolean().optional(),
+		openAiStrictToolSchemas: z.boolean().optional(),
+		[OPEN_AI_MODEL_ID_FIELD]: z.string().optional(),
+		openAiCustomModelInfo: modelInfoSchema.nullish(),
+		openAiUseAzure: z.boolean().optional(),
+		azureApiVersion: z.string().optional(),
+		openAiStreamingEnabled: z.boolean().optional(),
+		openAiHostHeader: z.string().optional(), // Keep temporarily for backward compatibility during migration.
+		openAiHeaders: z.record(z.string(), z.string()).optional(),
+		openAiExtraBody: openAiExtraBodySchema,
+	},
+})

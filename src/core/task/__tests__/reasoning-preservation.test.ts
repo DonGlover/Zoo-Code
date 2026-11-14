@@ -155,6 +155,7 @@ vi.mock("../../../utils/fs", () => ({
 
 // Import Task AFTER all vi.mock() calls - Vitest hoists mocks so this works
 import { Task } from "../Task"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 describe("Task reasoning preservation", () => {
 	let mockProvider: Partial<ClineProvider>
@@ -179,7 +180,7 @@ describe("Task reasoning preservation", () => {
 		}
 
 		mockApiConfiguration = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 			apiKey: "test-key",
 		} as ProviderSettings
 	})
@@ -510,5 +511,71 @@ describe("Task reasoning preservation", () => {
 			type: "text",
 			text: assistantText,
 		})
+	})
+
+	it("should keep plain text reasoning in buildCleanConversationHistory when preserveReasoning is true", async () => {
+		const task = new Task({
+			provider: mockProvider as ClineProvider,
+			apiConfiguration: mockApiConfiguration,
+			task: "Test task",
+			startTask: false,
+		})
+
+		const requestModelInfo: ModelInfo = {
+			contextWindow: 16000,
+			supportsPromptCache: true,
+			preserveReasoning: true,
+		}
+
+		await task["addToApiConversationHistory"](
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Reading the file." }],
+			},
+			"I should read the file first.",
+		)
+
+		const history = task["buildCleanConversationHistory"](task.apiConversationHistory, requestModelInfo)
+
+		expect(history).toHaveLength(1)
+		expect(history[0]).toMatchObject({
+			role: "assistant",
+			content: [
+				{ type: "reasoning", text: "I should read the file first.", summary: [] },
+				{ type: "text", text: "Reading the file." },
+			],
+		})
+	})
+
+	it("should strip plain text reasoning in buildCleanConversationHistory when preserveReasoning is not set", async () => {
+		const task = new Task({
+			provider: mockProvider as ClineProvider,
+			apiConfiguration: mockApiConfiguration,
+			task: "Test task",
+			startTask: false,
+		})
+
+		// preserveReasoning is undefined on this model info
+		const requestModelInfo: ModelInfo = {
+			contextWindow: 16000,
+			supportsPromptCache: true,
+		}
+
+		await task["addToApiConversationHistory"](
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Reading the file." }],
+			},
+			"I should read the file first.",
+		)
+
+		const history = task["buildCleanConversationHistory"](task.apiConversationHistory, requestModelInfo)
+
+		expect(history).toHaveLength(1)
+		expect(history[0]).toMatchObject({
+			role: "assistant",
+			content: "Reading the file.",
+		})
+		expect(JSON.stringify(history)).not.toContain("reasoning")
 	})
 })

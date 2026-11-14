@@ -1,14 +1,16 @@
+import { providerIdentifiers } from "@roo-code/types"
 import * as assert from "assert"
 
 import { RooCodeEventName, type ClineMessage } from "@roo-code/types"
 
 import { setDefaultSuiteTimeout } from "./test-utils"
-import { sleep, waitFor, waitUntilCompleted } from "./utils"
+import { isCompletedAsk, sleep, waitFor, waitUntilCompleted } from "./utils"
 import {
 	SCHED_COMPLETED_PROMPT,
 	SCHED_COMPLETED_RESULT,
 	SCHED_STANDALONE_FOLLOWUP_ANSWER,
 	SCHED_STANDALONE_PROMPT,
+	SUBTASK_APPROVAL_RESTORE_PARENT_PROMPT,
 	SUBTASK_ABANDON_CHILD_FOLLOWUP_ANSWER,
 	SUBTASK_ABANDON_PARENT_PROMPT,
 	SUBTASK_API_HANG_CHILD_MARKER,
@@ -91,10 +93,11 @@ const waitForAimockRequestContaining = async (
 // suite becomes flaky again on slow CI runners, widen this value first.
 const SUBTASK_API_HANG_DRAIN_GRACE_MS = 500
 
-// aimock does not observe client disconnects: after the API-hang child request is cancelled,
-// the mock keeps the delayed stream pending server-side until the fixture's ttft has fully
-// elapsed, then flushes the remaining chunks to the dead socket. A streamed request opened by
-// the next test can interleave with that late flush, so wait out the remainder of the delayed
+// aimock 1.47.0 stops and journals a reply when the client disconnects. Before that, the mock
+// kept the delayed stream pending server-side until the fixture's ttft had fully elapsed, then
+// flushed the remaining chunks to the dead socket. A streamed request opened by the next test
+// could interleave with that late flush. This wait is a conservative guard kept until an e2e
+// run shows it is not needed: wait out the remainder of the delayed
 // window before the next test runs. The deadline is anchored to the journal timestamp of the
 // request this test created (never earlier traffic), and bounded by one latency window plus
 // grace, so it cannot hide a genuine hang.
@@ -174,6 +177,90 @@ suite("Roo Code Subtasks", function () {
 		}
 	})
 
+	test("pending subtask approvals survive leave and return", async () => {
+		const api = globalThis.api
+		const asks: Record<string, ClineMessage[]> = {}
+
+		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
+			if (isCompletedAsk(message)) {
+				asks[taskId] = asks[taskId] || []
+				asks[taskId].push(message)
+			}
+		}
+		const hasToolAsk = (taskId: string, tool: "newTask" | "finishTask", after = 0) =>
+			asks[taskId]?.slice(after).some((message) => {
+				if (message.ask !== "tool" || !message.text) return false
+				try {
+					return JSON.parse(message.text).tool === tool
+				} catch {
+					return false
+				}
+			}) ?? false
+
+		api.on(RooCodeEventName.Message, messageHandler)
+
+		try {
+			const parentTaskId = await api.startNewTask({
+				configuration: {
+					mode: "ask",
+					alwaysAllowModeSwitch: true,
+					alwaysAllowSubtasks: false,
+					autoApprovalEnabled: false,
+					enableCheckpoints: false,
+				},
+				text: SUBTASK_APPROVAL_RESTORE_PARENT_PROMPT,
+			})
+
+			await waitFor(() => hasToolAsk(parentTaskId, "newTask"))
+			const parentAskCount = asks[parentTaskId]?.length ?? 0
+
+			await api.clearCurrentTask()
+			await api.resumeTask(parentTaskId)
+			await waitFor(() => hasToolAsk(parentTaskId, "newTask", parentAskCount))
+			assert.ok(
+				!asks[parentTaskId]?.slice(parentAskCount).some(({ ask }) => ask === "resume_task"),
+				"Restored parent should present newTask approval instead of Continue",
+			)
+			await api.approveCurrentAsk()
+
+			let childTaskId: string | undefined
+			await waitFor(() => {
+				const current = api.getCurrentTaskStack().at(-1)
+				if (current && current !== parentTaskId) {
+					childTaskId = current
+					return true
+				}
+				return false
+			})
+
+			await waitFor(() => hasToolAsk(childTaskId!, "finishTask"))
+			const childAskCount = asks[childTaskId!]?.length ?? 0
+
+			await api.clearCurrentTask()
+			await api.resumeTask(childTaskId!)
+			await waitFor(() => hasToolAsk(childTaskId!, "finishTask", childAskCount))
+			assert.ok(
+				!asks[childTaskId!]
+					?.slice(childAskCount)
+					.some(({ ask }) => ask === "resume_task" || ask === "resume_completed_task"),
+				"Restored child should present finishTask approval instead of a generic resume action",
+			)
+
+			await api.approveCurrentAsk()
+			await waitFor(() => api.getCurrentTaskStack().at(-1) === parentTaskId)
+			const childHistory = await api.getTaskHistoryItem(childTaskId!)
+			const parentHistory = await api.getTaskHistoryItem(parentTaskId)
+			assert.strictEqual(childHistory?.status, "completed")
+			assert.notStrictEqual(parentHistory?.status, "delegated")
+			assert.strictEqual(parentHistory?.awaitingChildId, undefined)
+		} finally {
+			api.off(RooCodeEventName.Message, messageHandler)
+			while (api.getCurrentTaskStack().length > 0) {
+				await api.clearCurrentTask()
+			}
+		}
+	})
+
 	// Smoke: child completing normally must resume the parent task.
 	test("child task returns to parent after normal completion", async () => {
 		const api = globalThis.api
@@ -181,7 +268,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -262,7 +349,7 @@ suite("Roo Code Subtasks", function () {
 		let delegationCompletedSummary: string | undefined
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -367,7 +454,7 @@ suite("Roo Code Subtasks", function () {
 		const messages: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -447,7 +534,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -530,7 +617,7 @@ suite("Roo Code Subtasks", function () {
 		let delayedChildRequestStartedAt: number | undefined
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -650,7 +737,7 @@ suite("Roo Code Subtasks", function () {
 
 		const aimockUrl = process.env.AIMOCK_URL
 		const parentProfile = {
-			apiProvider: "openrouter" as const,
+			apiProvider: providerIdentifiers.openrouter,
 			openRouterApiKey: "mock-key",
 			openRouterModelId: "openai/gpt-4.1",
 			rateLimitSeconds: 0,
@@ -757,7 +844,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -855,7 +942,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -1016,7 +1103,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}
@@ -1072,7 +1159,7 @@ suite("Roo Code Subtasks", function () {
 		const says: Record<string, ClineMessage[]> = {}
 
 		const messageHandler = ({ taskId, message }: { taskId: string; message: ClineMessage }) => {
-			if (message.type === "ask") {
+			if (isCompletedAsk(message)) {
 				asks[taskId] = asks[taskId] || []
 				asks[taskId].push(message)
 			}

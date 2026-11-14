@@ -26,6 +26,7 @@ vitest.mock("../../../i18n", () => ({
 	t: (key: string) => key,
 }))
 
+import type { MockInstance } from "vitest"
 import OpenAI from "openai"
 
 import { zooGatewayDefaultModelId, ZOO_GATEWAY_DEFAULT_TEMPERATURE } from "@roo-code/types"
@@ -43,32 +44,37 @@ vitest.mock("delay", () => ({
 		return Promise.resolve()
 	}),
 }))
+const DEFAULT_MODEL_CATALOG = vitest.hoisted(() => ({
+	"anthropic/claude-sonnet-4": {
+		maxTokens: 64000,
+		contextWindow: 200000,
+		supportsImages: true,
+		supportsPromptCache: true,
+		inputPrice: 3,
+		outputPrice: 15,
+		cacheWritesPrice: 3.75,
+		cacheReadsPrice: 0.3,
+		description: "Claude Sonnet 4",
+	},
+	"anthropic/claude-3.5-haiku": {
+		maxTokens: 32000,
+		contextWindow: 200000,
+		supportsImages: true,
+		supportsPromptCache: true,
+		inputPrice: 1,
+		outputPrice: 5,
+		cacheWritesPrice: 1.25,
+		cacheReadsPrice: 0.1,
+		description: "Claude 3.5 Haiku",
+	},
+}))
+
 vitest.mock("../fetchers/modelCache", () => ({
 	getModels: vitest.fn().mockImplementation(function () {
-		return Promise.resolve({
-			"anthropic/claude-sonnet-4": {
-				maxTokens: 64000,
-				contextWindow: 200000,
-				supportsImages: true,
-				supportsPromptCache: true,
-				inputPrice: 3,
-				outputPrice: 15,
-				cacheWritesPrice: 3.75,
-				cacheReadsPrice: 0.3,
-				description: "Claude Sonnet 4",
-			},
-			"anthropic/claude-3.5-haiku": {
-				maxTokens: 32000,
-				contextWindow: 200000,
-				supportsImages: true,
-				supportsPromptCache: true,
-				inputPrice: 1,
-				outputPrice: 5,
-				cacheWritesPrice: 1.25,
-				cacheReadsPrice: 0.1,
-				description: "Claude 3.5 Haiku",
-			},
-		})
+		return Promise.resolve(DEFAULT_MODEL_CATALOG)
+	}),
+	refreshModels: vitest.fn().mockImplementation(function () {
+		return Promise.resolve(DEFAULT_MODEL_CATALOG)
 	}),
 	getModelsFromCache: vitest.fn().mockReturnValue(undefined),
 }))
@@ -119,8 +125,22 @@ describe("ZooGatewayHandler", () => {
 		zooGatewayModelId: "anthropic/claude-sonnet-4",
 	}
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		clearAllMocks()
+		const { getModels, refreshModels, getModelsFromCache } = await import("../fetchers/modelCache")
+		vitest
+			.mocked(getModels)
+			.mockReset()
+			.mockImplementation(function () {
+				return Promise.resolve(DEFAULT_MODEL_CATALOG)
+			})
+		vitest
+			.mocked(refreshModels)
+			.mockReset()
+			.mockImplementation(function () {
+				return Promise.resolve(DEFAULT_MODEL_CATALOG)
+			})
+		vitest.mocked(getModelsFromCache).mockReset().mockReturnValue(undefined)
 		mockSessionCleared.value = false
 		mockGetCachedZooCodeToken.mockReturnValue(undefined)
 		mockCreate.mockClear()
@@ -277,6 +297,73 @@ describe("ZooGatewayHandler", () => {
 			])
 		})
 
+		it("forwards gateway usage.cost as totalCost so the panel matches billing", async () => {
+			mockCreate.mockImplementation(async () =>
+				asyncStreamFrom([
+					{
+						choices: [{ delta: { content: "ok" }, index: 0 }],
+						usage: null,
+					},
+					{
+						choices: [{ delta: {}, index: 0 }],
+						usage: {
+							prompt_tokens: 25694,
+							completion_tokens: 829,
+							total_tokens: 26523,
+							cost: 0.006262,
+						},
+					},
+				]),
+			)
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const chunks = await collectStream(
+				handler.createMessage("You are helpful.", [{ role: "user", content: "Hello" }]),
+			)
+
+			expect(chunks).toContainEqual({
+				type: "usage",
+				inputTokens: 25694,
+				outputTokens: 829,
+				cacheWriteTokens: undefined,
+				cacheReadTokens: undefined,
+				totalCost: 0.006262,
+			})
+		})
+
+		it("defaults totalCost to 0 when usage omits cost", async () => {
+			mockCreate.mockImplementation(async () =>
+				asyncStreamFrom([
+					{
+						choices: [{ delta: { content: "ok" }, index: 0 }],
+						usage: null,
+					},
+					{
+						choices: [{ delta: {}, index: 0 }],
+						usage: {
+							prompt_tokens: 10,
+							completion_tokens: 5,
+							total_tokens: 15,
+						},
+					},
+				]),
+			)
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const chunks = await collectStream(
+				handler.createMessage("You are helpful.", [{ role: "user", content: "Hello" }]),
+			)
+
+			expect(chunks).toContainEqual({
+				type: "usage",
+				inputTokens: 10,
+				outputTokens: 5,
+				cacheWriteTokens: undefined,
+				cacheReadTokens: undefined,
+				totalCost: 0,
+			})
+		})
+
 		it("forwards task and mode metadata as request headers", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
 
@@ -414,10 +501,17 @@ describe("ZooGatewayHandler", () => {
 	})
 
 	describe("completePrompt", () => {
+		let consoleError: MockInstance<typeof console.error>
+
 		beforeEach(() => {
 			mockCreate.mockImplementation(async () => ({
 				choices: [{ message: { role: "assistant", content: "Test completion response" } }],
 			}))
+			consoleError = vitest.spyOn(console, "error").mockImplementation(() => {})
+		})
+
+		afterEach(() => {
+			consoleError.mockRestore()
 		})
 
 		it("returns completion text from the gateway", async () => {
@@ -434,6 +528,7 @@ describe("ZooGatewayHandler", () => {
 					temperature: ZOO_GATEWAY_DEFAULT_TEMPERATURE,
 					max_completion_tokens: 64000,
 				}),
+				{},
 			)
 		})
 
@@ -448,13 +543,286 @@ describe("ZooGatewayHandler", () => {
 			)
 		})
 
-		it("returns an empty string when the model returns no content", async () => {
+		it("forwards a per-request signal and the timeout to the SDK", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
-			mockCreate.mockImplementation(async () => ({
-				choices: [{ message: { role: "assistant", content: null } }],
-			}))
+			const caller = new AbortController()
+
+			await handler.completePrompt("Test", { abortSignal: caller.signal, timeoutMs: 5_000 })
+
+			const requestOptions = mockCreate.mock.calls[0][1] as { signal?: AbortSignal; timeout?: number }
+			expect(requestOptions.signal).toBeInstanceOf(AbortSignal)
+			expect(requestOptions.signal).not.toBe(caller.signal)
+			expect(requestOptions.timeout).toBe(5_000)
+		})
+
+		it("sends no signal when the caller gives none", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+
+			await handler.completePrompt("Test")
+
+			expect(mockCreate.mock.calls[0][1]).toEqual({})
+		})
+
+		it.each([
+			["with a session", mockOptions],
+			["without a session", { zooGatewayModelId: "anthropic/claude-sonnet-4" }],
+		])(
+			"rejects a pre-aborted signal with an AbortError, %s, before model lookup",
+			async (_label, options: ApiHandlerOptions) => {
+				const { getModels } = await import("../fetchers/modelCache")
+				const handler = new ZooGatewayHandler(options)
+				const caller = new AbortController()
+				caller.abort()
+
+				await expect(handler.completePrompt("Test", { abortSignal: caller.signal })).rejects.toMatchObject({
+					name: "AbortError",
+				})
+				expect(getModels).not.toHaveBeenCalled()
+				expect(mockCreate).not.toHaveBeenCalled()
+			},
+		)
+
+		it("keeps an ordinary model lookup failure while the caller signal is live", async () => {
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
+			const lookupFailure = new Error("model catalog unavailable")
+			vitest.mocked(getModels).mockRejectedValue(lookupFailure)
+			vitest.mocked(refreshModels).mockRejectedValue(lookupFailure)
+			const handler = new ZooGatewayHandler(mockOptions)
+
+			await expect(handler.completePrompt("Test", { abortSignal: new AbortController().signal })).rejects.toBe(
+				lookupFailure,
+			)
+		})
+
+		it.each([
+			["a raw AbortError", Object.assign(new Error("The user aborted a request"), { name: "AbortError" })],
+			["the SDK abort error", new Error("Request was aborted.")],
+		])(
+			"normalizes %s from the model lookup to the provider AbortError while the caller signal is live",
+			async (_label, lookupFailure: Error) => {
+				const { getModels, refreshModels } = await import("../fetchers/modelCache")
+				vitest.mocked(getModels).mockRejectedValue(lookupFailure)
+				vitest.mocked(refreshModels).mockRejectedValue(lookupFailure)
+				const handler = new ZooGatewayHandler(mockOptions)
+
+				await expect(
+					handler.completePrompt("Test", { abortSignal: new AbortController().signal }),
+				).rejects.toMatchObject({
+					name: "AbortError",
+					message: "The Zoo Gateway request was aborted",
+				})
+				expect(mockCreate).not.toHaveBeenCalled()
+			},
+		)
+
+		it("rejects with an AbortError when the timeout alone expires during the SDK call", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			let sdkSignal: AbortSignal | undefined
+			mockCreate.mockImplementation((_params: unknown, requestOptions: { signal?: AbortSignal }) => {
+				sdkSignal = requestOptions.signal
+				return new Promise(() => {})
+			})
+
+			await expect(handler.completePrompt("Test", { timeoutMs: 20 })).rejects.toMatchObject({
+				name: "AbortError",
+				message: "The Zoo Gateway request was aborted",
+			})
+			expect(sdkSignal?.aborted).toBe(true)
+			expect(showErrorMessage).not.toHaveBeenCalled()
+		})
+
+		it("settles on abort while a gateway error notification waits for the user", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			mockCreate.mockRejectedValue(makeApiError(402))
+			showErrorMessage.mockImplementation(() => new Promise(() => {}))
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal })
+			await vitest.waitFor(() => expect(showErrorMessage).toHaveBeenCalled())
+			caller.abort()
+
+			await expect(pending).rejects.toMatchObject({
+				name: "AbortError",
+				message: "The Zoo Gateway request was aborted",
+			})
+			// The abort is not a failure of the notification, so nothing is logged.
+			expect(consoleError).not.toHaveBeenCalled()
+		})
+
+		it.each([
+			["with a live caller signal", true, new Error("notification failed"), "notification failed"],
+			["without a caller signal", false, "notification dismissed", "notification dismissed"],
+		])(
+			"logs a failed gateway error notification and still rejects with the gateway error, %s",
+			async (_label, withSignal: boolean, notificationFailure: unknown, logged: string) => {
+				const handler = new ZooGatewayHandler(mockOptions)
+				mockCreate.mockRejectedValue(makeApiError(402, { message: "out of credits" }))
+				showErrorMessage.mockRejectedValue(notificationFailure)
+				const options = withSignal ? { abortSignal: new AbortController().signal } : undefined
+
+				await expect(handler.completePrompt("Test", options)).rejects.toThrow(
+					"Zoo Gateway completion error: out of credits",
+				)
+				expect(consoleError).toHaveBeenCalledWith("Failed to surface Zoo Gateway error:", logged)
+			},
+		)
+
+		it("rethrows an SDK failure that is not an Error unchanged", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const failure = { reason: "upstream failure" }
+			mockCreate.mockRejectedValue(failure)
+
+			await expect(handler.completePrompt("Test", { abortSignal: new AbortController().signal })).rejects.toBe(
+				failure,
+			)
+		})
+
+		it("rejects with an AbortError when the timeout alone expires during model lookup", async () => {
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockImplementation(() => new Promise(() => {}))
+			const handler = new ZooGatewayHandler(mockOptions)
+
+			await expect(handler.completePrompt("Test", { timeoutMs: 20 })).rejects.toMatchObject({
+				name: "AbortError",
+				message: "The Zoo Gateway request was aborted",
+			})
+			expect(mockCreate).not.toHaveBeenCalled()
+		})
+
+		it("rejects with an AbortError when the signal aborts during model lookup", async () => {
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockImplementation(() => new Promise(() => {}))
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal })
+			caller.abort()
+
+			await expect(pending).rejects.toMatchObject({
+				name: "AbortError",
+				message: "The Zoo Gateway request was aborted",
+			})
+			expect(mockCreate).not.toHaveBeenCalled()
+		})
+
+		it("rejects with an AbortError at once when aborted mid-flight, without a gateway error", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			let sdkSignal: AbortSignal | undefined
+			// The SDK call never settles, as when the SDK sleeps between retries.
+			mockCreate.mockImplementation((_params: unknown, requestOptions: { signal?: AbortSignal }) => {
+				sdkSignal = requestOptions.signal
+				return new Promise(() => {})
+			})
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal })
+			await vitest.waitFor(() => expect(mockCreate).toHaveBeenCalled())
+			caller.abort()
+
+			await expect(pending).rejects.toMatchObject({
+				name: "AbortError",
+				message: "The Zoo Gateway request was aborted",
+			})
+			expect(sdkSignal?.aborted).toBe(true)
+			expect(showErrorMessage).not.toHaveBeenCalled()
+		})
+
+		it("reports an SDK abort error after the caller aborts as an AbortError, not a gateway error", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			mockCreate.mockImplementation(async () => {
+				caller.abort()
+				throw new Error("Request was aborted.")
+			})
+
+			await expect(handler.completePrompt("Test", { abortSignal: caller.signal })).rejects.toMatchObject({
+				name: "AbortError",
+			})
+			expect(showErrorMessage).not.toHaveBeenCalled()
+		})
+
+		it("shows no gateway error for a 402 that rejects just before the caller aborts", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			let rejectCompletion: (reason: unknown) => void = () => {}
+			const completion = new Promise((_resolve, reject) => {
+				rejectCompletion = reject
+			})
+			mockCreate.mockImplementation(() => completion)
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal })
+			await vitest.waitFor(() => expect(mockCreate).toHaveBeenCalled())
+			// This callback runs after the handler's own race settles with the 402 but before completePrompt
+			// resumes, so only the abort check before the notification keeps the 402 notification away.
+			completion.catch(() => caller.abort())
+			rejectCompletion(makeApiError(402))
+
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" })
+			expect(showErrorMessage).not.toHaveBeenCalled()
+		})
+
+		it("does not return a completion that resolves just before the caller aborts", async () => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			let resolveCompletion: (value: unknown) => void = () => {}
+			const completion = new Promise((resolve) => {
+				resolveCompletion = resolve
+			})
+			mockCreate.mockImplementation(() => completion)
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal })
+			await vitest.waitFor(() => expect(mockCreate).toHaveBeenCalled())
+			// This callback runs after the handler's own race settles but before completePrompt resumes,
+			// so only the check after the await can drop the late result.
+			void completion.then(() => caller.abort())
+			resolveCompletion({ choices: [{ message: { role: "assistant", content: "late" } }] })
+
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" })
+		})
+
+		it.each([
+			["a completed request", () => {}],
+			["a failed request", () => mockCreate.mockRejectedValue(new Error("upstream failure"))],
+			["a request aborted mid-flight", () => mockCreate.mockImplementation(() => new Promise(() => {}))],
+		])("removes the same abort listener from the caller's signal after %s", async (_label, setup) => {
+			setup()
+			const handler = new ZooGatewayHandler(mockOptions)
+			const caller = new AbortController()
+			const addListener = vitest.spyOn(caller.signal, "addEventListener")
+			const removeListener = vitest.spyOn(caller.signal, "removeEventListener")
+
+			const pending = handler.completePrompt("Test", { abortSignal: caller.signal }).catch(() => undefined)
+			await vitest.waitFor(() => expect(mockCreate).toHaveBeenCalled())
+			caller.abort()
+			await pending
+
+			const abortListeners = addListener.mock.calls.filter(([type]) => type === "abort")
+			expect(abortListeners).toHaveLength(1)
+			expect(removeListener).toHaveBeenCalledWith("abort", abortListeners[0][1])
+		})
+
+		it.each([
+			["no content", [{ message: { role: "assistant", content: null } }]],
+			["no choices", []],
+		])("returns an empty string when the model returns %s", async (_label, choices: unknown[]) => {
+			const handler = new ZooGatewayHandler(mockOptions)
+			mockCreate.mockImplementation(async () => ({ choices }))
 
 			await expect(handler.completePrompt("Test")).resolves.toBe("")
+		})
+
+		it.each([
+			["with a live caller signal", { abortSignal: new AbortController().signal }],
+			["without a caller signal", undefined],
+		])("requires a session before the model lookup, %s", async (_label, options) => {
+			const { getModels } = await import("../fetchers/modelCache")
+			const handler = new ZooGatewayHandler({ zooGatewayModelId: "anthropic/claude-sonnet-4" })
+
+			await expect(handler.completePrompt("Test", options)).rejects.toThrow(
+				"Zoo Gateway requires authentication. Please sign in to Zoo Code first.",
+			)
+			expect(getModels).not.toHaveBeenCalled()
+			expect(mockCreate).not.toHaveBeenCalled()
 		})
 	})
 
@@ -628,45 +996,289 @@ describe("ZooGatewayHandler", () => {
 	describe("ensureModelFetched", () => {
 		it("fetches models when instance models are empty", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
-			const { getModels } = await import("../fetchers/modelCache")
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
 
 			expect(handler.getModel().info.contextWindow).toBe(200000)
 
 			await handler.ensureModelFetched()
 
 			expect(getModels).toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
+		})
+
+		it("settles the waiter with a rejection when the signal aborts mid-fetch", async () => {
+			// A caller that gives up must not leave a handler-side waiter pending
+			// on the (shared) catalog fetch: with an observing signal, the
+			// ensureModelFetched promise rejects at abort time, while the
+			// underlying fetch continues untouched for any other waiter.
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockImplementationOnce(() => new Promise(() => {}))
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+
+			const wait = handler.ensureModelFetched(controller.signal)
+			// Let the waiter attach its abort listener before cancelling.
+			await Promise.resolve()
+			controller.abort()
+
+			await expect(wait).rejects.toThrow()
+		})
+
+		it("settles the waiter when the fetch wins against a live signal and detaches the listener", async () => {
+			// Fetch-wins branch: resolve() must settle the await (a dropped
+			// resolve or a detached .then handler hangs this test), the abort
+			// listener must be registered with the real { once: true } options
+			// object, and the detach must target the *same* event name/handler
+			// pair that was registered — a mutated event name detaches nothing.
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			const addEventListenerSpy = vitest.spyOn(controller.signal, "addEventListener")
+			const removeEventListenerSpy = vitest.spyOn(controller.signal, "removeEventListener")
+
+			await handler.ensureModelFetched(controller.signal)
+
+			expect(addEventListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function), { once: true })
+			const registered = addEventListenerSpy.mock.calls.find(([event]) => event === "abort")
+			expect(registered).toBeDefined()
+			expect(removeEventListenerSpy).toHaveBeenCalledWith("abort", registered?.[1])
+		})
+
+		it("rejects a signal-observing waiter with the fetch error and detaches the listener", async () => {
+			// Rejection-branch twin of the fetch-wins test: reject(error) must
+			// propagate the catalog failure to the waiter (a dropped reject hangs
+			// this test) and the listener must be detached under the right event
+			// name. The no-signal reject path cannot attach a listener, so this is the only
+			// coverage of the reject-side detach.
+			const { getModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockRejectedValueOnce(new Error("network down"))
+
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			const addEventListenerSpy = vitest.spyOn(controller.signal, "addEventListener")
+			const removeEventListenerSpy = vitest.spyOn(controller.signal, "removeEventListener")
+
+			await expect(handler.ensureModelFetched(controller.signal)).rejects.toThrow("network down")
+			const registered = addEventListenerSpy.mock.calls.find(([event]) => event === "abort")
+			expect(registered).toBeDefined()
+			expect(removeEventListenerSpy).toHaveBeenCalledWith("abort", registered?.[1])
+		})
+
+		it("never starts a wait when the signal is already aborted", async () => {
+			const { getModels } = await import("../fetchers/modelCache")
+			const handler = new ZooGatewayHandler(mockOptions)
+			const controller = new AbortController()
+			controller.abort()
+
+			await expect(handler.ensureModelFetched(controller.signal)).rejects.toThrow()
+			// Without the spy, a guard relocated after fetchModel() starts would
+			// still reject here and settle identically; zero getModels calls pins
+			// that the check runs before the fetch starts.
+			expect(vitest.mocked(getModels)).not.toHaveBeenCalled()
 		})
 
 		it("skips the fetch when models are already populated", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
-			const { getModels } = await import("../fetchers/modelCache")
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
 
 			await handler.ensureModelFetched()
 			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
 
 			await handler.ensureModelFetched()
 			expect(getModels).not.toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
 		})
 
 		it("short-circuits a subsequent fetchModel call after models are populated", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
-			const { getModels } = await import("../fetchers/modelCache")
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
 
 			await handler.ensureModelFetched()
 			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
 
 			await handler.fetchModel()
 			expect(getModels).not.toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
+		})
+
+		it("refetches when the configured model is missing from a populated map", async () => {
+			vitest.useFakeTimers()
+			try {
+				const { getModels, refreshModels } = await import("../fetchers/modelCache")
+				const staleCatalog = {
+					"anthropic/claude-sonnet-4": {
+						maxTokens: 64000,
+						contextWindow: 200000,
+						supportsImages: true,
+						supportsPromptCache: true,
+						inputPrice: 3,
+						outputPrice: 15,
+					},
+				}
+				vitest.mocked(getModels).mockResolvedValueOnce(staleCatalog)
+				vitest.mocked(refreshModels).mockResolvedValueOnce(staleCatalog)
+
+				const handler = new ZooGatewayHandler({
+					...mockOptions,
+					zooGatewayModelId: "alibaba/qwen3.8-max",
+				})
+
+				await handler.ensureModelFetched()
+				expect(handler.getModel().info.inputPrice).toBe(0)
+
+				const freshCatalog = {
+					"alibaba/qwen3.8-max": {
+						maxTokens: 65536,
+						contextWindow: 1_000_000,
+						supportsImages: true,
+						supportsPromptCache: true,
+						inputPrice: 0.222,
+						outputPrice: 0.667,
+					},
+				}
+				vitest.mocked(getModels).mockClear()
+				vitest.mocked(refreshModels).mockClear()
+				vitest.mocked(getModels).mockResolvedValueOnce(freshCatalog)
+
+				vitest.advanceTimersByTime(5 * 60 * 1000 + 1)
+				await handler.ensureModelFetched()
+
+				expect(getModels).toHaveBeenCalled()
+				expect(refreshModels).not.toHaveBeenCalled()
+				expect(handler.getModel().info.inputPrice).toBe(0.222)
+				expect(handler.getModel().info.outputPrice).toBe(0.667)
+			} finally {
+				vitest.useRealTimers()
+			}
+		})
+
+		it("does not reuse default model prices for an unknown configured model", async () => {
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockResolvedValueOnce({})
+			vitest.mocked(refreshModels).mockResolvedValueOnce({})
+
+			const handler = new ZooGatewayHandler({
+				...mockOptions,
+				zooGatewayModelId: "alibaba/qwen3.8-max",
+			})
+
+			await handler.ensureModelFetched()
+
+			const { id, info } = handler.getModel()
+			expect(id).toBe("alibaba/qwen3.8-max")
+			expect(info.inputPrice).toBe(0)
+			expect(info.outputPrice).toBe(0)
+			expect(info.cacheWritesPrice).toBe(0)
+			expect(info.cacheReadsPrice).toBe(0)
+		})
+
+		it("does not refetch an unresolved model on every ensureModelFetched call", async () => {
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
+			const catalog = {
+				"anthropic/claude-sonnet-4": {
+					maxTokens: 64000,
+					contextWindow: 200000,
+					supportsImages: true,
+					supportsPromptCache: true,
+					inputPrice: 3,
+					outputPrice: 15,
+				},
+			}
+			vitest.mocked(getModels).mockResolvedValue(catalog)
+			vitest.mocked(refreshModels).mockResolvedValue(catalog)
+
+			const handler = new ZooGatewayHandler({
+				...mockOptions,
+				zooGatewayModelId: "alibaba/qwen3.8-max",
+			})
+
+			await handler.ensureModelFetched()
+			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
+
+			await handler.ensureModelFetched()
+			await handler.ensureModelFetched()
+
+			expect(getModels).not.toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
+			expect(handler.getModel().info.inputPrice).toBe(0)
+		})
+
+		it("negative-caches an empty catalog response for a missing model", async () => {
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockResolvedValue({})
+			vitest.mocked(refreshModels).mockResolvedValue({})
+
+			const handler = new ZooGatewayHandler({
+				...mockOptions,
+				zooGatewayModelId: "alibaba/qwen3.8-max",
+			})
+
+			await handler.ensureModelFetched()
+			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
+
+			await handler.ensureModelFetched()
+
+			expect(getModels).not.toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
+			expect(handler.getModel().info.inputPrice).toBe(0)
+		})
+
+		it("force-refreshes before negative-caching when shared catalog is stale", async () => {
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
+			vitest.mocked(getModels).mockResolvedValueOnce({
+				"anthropic/claude-sonnet-4": {
+					maxTokens: 64000,
+					contextWindow: 200000,
+					supportsImages: true,
+					supportsPromptCache: true,
+					inputPrice: 3,
+					outputPrice: 15,
+				},
+			})
+			vitest.mocked(refreshModels).mockResolvedValueOnce({
+				"alibaba/qwen3.8-max": {
+					maxTokens: 65536,
+					contextWindow: 1_000_000,
+					supportsImages: true,
+					supportsPromptCache: true,
+					inputPrice: 0.222,
+					outputPrice: 0.667,
+				},
+			})
+
+			const handler = new ZooGatewayHandler({
+				...mockOptions,
+				zooGatewayModelId: "alibaba/qwen3.8-max",
+			})
+
+			await handler.ensureModelFetched()
+
+			expect(getModels).toHaveBeenCalled()
+			expect(refreshModels).toHaveBeenCalled()
+			expect(handler.getModel().info.inputPrice).toBe(0.222)
+			expect(handler.getModel().info.outputPrice).toBe(0.667)
+
+			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
+			await handler.ensureModelFetched()
+			expect(getModels).not.toHaveBeenCalled()
+			expect(refreshModels).not.toHaveBeenCalled()
 		})
 
 		it("deduplicates concurrent calls into a single fetch", async () => {
 			const handler = new ZooGatewayHandler(mockOptions)
-			const { getModels } = await import("../fetchers/modelCache")
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
 			vitest.mocked(getModels).mockClear()
+			vitest.mocked(refreshModels).mockClear()
 
 			await Promise.all([handler.ensureModelFetched(), handler.ensureModelFetched()])
 
 			expect(getModels).toHaveBeenCalledTimes(1)
+			expect(refreshModels).not.toHaveBeenCalled()
 		})
 
 		it("recovers after a rejected fetch so later calls are not poisoned", async () => {
@@ -690,7 +1302,7 @@ describe("ZooGatewayHandler", () => {
 		})
 
 		it("makes getModel return the fetched context window instead of the default", async () => {
-			const { getModels } = await import("../fetchers/modelCache")
+			const { getModels, refreshModels } = await import("../fetchers/modelCache")
 			vitest.mocked(getModels).mockResolvedValueOnce({
 				"google/gemini-2.5-pro": {
 					maxTokens: 65536,
@@ -710,6 +1322,7 @@ describe("ZooGatewayHandler", () => {
 			await handler.ensureModelFetched()
 
 			expect(handler.getModel().info.contextWindow).toBe(1048576)
+			expect(refreshModels).not.toHaveBeenCalled()
 		})
 	})
 })

@@ -1,4 +1,13 @@
-import type { ModelInfo } from "../model.js"
+import { z } from "zod"
+
+import { type ModelInfo } from "../model.js"
+import { providerIdentifiers } from "../provider-identifiers.js"
+import {
+	API_MODEL_ID_FIELD,
+	apiModelIdProviderModelShape,
+	createModelIdAccessor,
+	createProviderDefinition,
+} from "./common.js"
 
 // https://ai.google.dev/gemini-api/docs/models/gemini
 export type GeminiModelId = keyof typeof geminiModels
@@ -6,6 +15,26 @@ export type GeminiModelId = keyof typeof geminiModels
 export const geminiDefaultModelId: GeminiModelId = "gemini-3.1-pro-preview"
 
 export const geminiModels = {
+	// https://cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-argon
+	"gemini-4-argon": {
+		maxTokens: 65_536, // Single-request streaming cap; long decodes up to 1M via continuation tokens.
+		contextWindow: 1_048_576, // Shared across input, thinking, and output tokens.
+		supportsImages: true,
+		// Implicit caching only (automatic for prompt prefixes >= 6,144 tokens);
+		// explicit context caching is not supported on this model.
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["low", "medium", "high"],
+		reasoningEffort: "medium",
+		// thinking_budget returns an HTTP 400 error on this model.
+		supportsReasoningBudget: false,
+		// The backend ignores temperature/top_p/top_k.
+		supportsTemperature: false,
+		// Promo pricing through Nov 30, 2026; from Dec 1, 2026: input $4.00,
+		// output $20.00, cached input $0.20 per 1M tokens.
+		inputPrice: 2.0,
+		outputPrice: 10.0, // Includes thinking tokens.
+		cacheReadsPrice: 0.1,
+	},
 	"gemini-3.7-flash": {
 		maxTokens: 65_536,
 		contextWindow: 1_048_576,
@@ -145,6 +174,37 @@ export const geminiModels = {
 		outputPrice: 3.0,
 		cacheReadsPrice: 0.05,
 	},
+	// 3.x Flash Lite models
+	"gemini-3.5-flash-lite": {
+		maxTokens: 65_536,
+		contextWindow: 1_048_576,
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["minimal", "low", "medium", "high"],
+		// Matches the documented API default thinking level (On (minimal)).
+		reasoningEffort: "minimal",
+		inputPrice: 0.3,
+		outputPrice: 2.5,
+		cacheReadsPrice: 0.03,
+		cacheWritesPrice: 1.0,
+		supportsReasoningBudget: false,
+	},
+	"gemini-3.1-flash-lite": {
+		maxTokens: 65_536,
+		contextWindow: 1_048_576,
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsReasoningEffort: ["minimal", "low", "medium", "high"],
+		// Lowest level of the supported set: keeps the cheap/free tier's
+		// default latency and cost in line with the Flash Lite tier.
+		reasoningEffort: "minimal",
+		inputPrice: 0.25,
+		outputPrice: 1.5,
+		cacheReadsPrice: 0.025,
+		cacheWritesPrice: 1.0,
+		supportsReasoningBudget: false,
+	},
+
 	// 2.5 Pro models
 	"gemini-2.5-pro": {
 		maxTokens: 64_000,
@@ -323,3 +383,15 @@ export const geminiModels = {
 		maxThinkingTokens: 24_576,
 	},
 } as const satisfies Record<string, ModelInfo>
+
+export const geminiProviderDefinition = createProviderDefinition({
+	apiProvider: providerIdentifiers.gemini,
+	modelIdKey: API_MODEL_ID_FIELD,
+	getModelId: createModelIdAccessor(API_MODEL_ID_FIELD),
+	getDefaultModelId: () => geminiDefaultModelId,
+	schema: {
+		...apiModelIdProviderModelShape,
+		geminiApiKey: z.string().optional(),
+		googleGeminiBaseUrl: z.string().optional(),
+	},
+})

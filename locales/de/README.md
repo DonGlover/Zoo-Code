@@ -47,13 +47,11 @@ Zoo Code baut auf dem von Roo Code geschaffenen Fundament auf und erweitert es f
 - **Zuverlässigere Terminal- und Bearbeitungsabläufe** — Korrekturen für vorzeitige Terminalabschlüsse, Race Conditions beim Aufgabenstatus, Kontextverwaltung, diff-Bearbeitung und anbieterspezifische Tool-Nutzung.
 - **Mehr Kontrolle über deinen Workspace** — Regelverwaltung, MCP-Beschränkungen pro Modus, Pfadsteuerung für Multi-Root-Workspaces, Reasoning-Optionen für Modelle und Aktionen zur Prüfung von Änderungen nach Abschluss.
 
-## Neu in v3.78.0
+## Neu in v3.96.0
 
-- **Drei bedeutende neue Modelle sind da** — nutze die brandneuen Modelle Gemini 3.7 Flash, GLM 5.3 und Qwen3.8 Max sowie aktualisiertes Reasoning, Preise und Anbieterabdeckung für DeepSeek V4.
-- **Verbinde dich mit NanoGPT** — nutze dynamische Modellerkennung, Streaming und Prompt-Vervollständigung sowie Routing-Einstellungen für Geschwindigkeit, Preis, Latenz, Durchsatz, Tool-Unterstützung und Caching.
-- **Zuverlässigere Anbieter und Aufgaben** — Korrekturen verbessern die Einrichtung von Azure-OpenAI-Endpunkten, Kimi-Code-Ausgabelimits, die Beibehaltung von Titeln im Aufgabenverlauf sowie den Import und Export von Zoo-Einstellungen.
-- Destructive Command Guard unterstützt jetzt Intel-basierte Macs.
-- Sicherheitsupdates beheben Schwachstellen in `undici` und Mermaid.
+- ✨ **Neue Chat-Einstellungen und Diagnose:** Zeige Nachrichten-Zeitstempel mit konfigurierbaren Zeit- und Datumsformaten, stimme die Prompt-Cache-TTL für Anthropic-Profile ab und erstelle datenschutzfreundliche Diagnoseberichte.
+- 💸 **Genauere Anbieterkosten und Caching:** Anthropic-Ergebnisse bleiben intakt, kumulative Output-Tokens fließen in Anthropic- und MiniMax-Kosten ein, DeepSeek-Prompt-Cache-Zähler werden ausgelesen, der xAI-Responses-Cache wird gezielt angesprochen und Mistral-Cache-Lesungen werden mit 0,1x abgerechnet.
+- 🧭 **Zuverlässigere und schnellere Chats:** Setze abgeschlossene Aufgaben nach einem Neustart fort, stelle Checkpoints wieder her, wenn der gespeicherte Commit fehlt, lade einen toten Webview-Renderer automatisch neu, drossle Streaming-Updates und lade Sprachen bei Bedarf.
 
 ## Was kann Zoo Code für DICH tun?
 

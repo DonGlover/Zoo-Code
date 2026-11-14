@@ -2,15 +2,15 @@ import * as React from "react"
 import { CaretUpIcon } from "@radix-ui/react-icons"
 import { Check, X } from "lucide-react"
 import { Fzf } from "fzf"
-import { useTranslation } from "react-i18next"
+import { useAppTranslation } from "@src/i18n/TranslationContext"
 
 import { cn } from "@/lib/utils"
 import { useRooPortal } from "./hooks/useRooPortal"
+import { enabledSelectorTriggerClassName, selectorTriggerClassName } from "./selectorTriggerStyles"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui"
 import { StandardTooltip } from "@/components/ui"
 
 export enum DropdownOptionType {
-	ITEM = "item",
 	SEPARATOR = "separator",
 	SHORTCUT = "shortcut",
 	ACTION = "action",
@@ -62,7 +62,7 @@ export const SelectDropdown = React.memo(
 			},
 			ref,
 		) => {
-			const { t } = useTranslation()
+			const { t } = useAppTranslation()
 			const [open, setOpen] = React.useState(false)
 			const [searchValue, setSearchValue] = React.useState("")
 			const searchInputRef = React.useRef<HTMLInputElement>(null)
@@ -193,11 +193,9 @@ export const SelectDropdown = React.memo(
 					data-testid="dropdown-trigger"
 					className={cn(
 						"w-full min-w-0 max-w-full inline-flex items-center gap-1.5 relative whitespace-nowrap px-1.5 py-1 text-xs",
-						"bg-transparent border border-[rgba(255,255,255,0.08)] rounded-md text-vscode-foreground w-auto",
-						"transition-all duration-150 focus:outline-none focus-visible:ring-1 focus-visible:ring-vscode-focusBorder focus-visible:ring-inset",
-						disabled
-							? "opacity-50 cursor-not-allowed"
-							: "opacity-90 hover:opacity-100 hover:bg-[rgba(255,255,255,0.03)] hover:border-[rgba(255,255,255,0.15)] cursor-pointer",
+						selectorTriggerClassName,
+						"w-auto",
+						disabled ? "opacity-50 cursor-not-allowed" : enabledSelectorTriggerClassName,
 						triggerClassName,
 					)}>
 					<CaretUpIcon className="pointer-events-none opacity-80 flex-shrink-0 size-3" />

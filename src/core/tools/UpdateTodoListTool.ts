@@ -64,13 +64,18 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				approvedTodoList !== undefined && JSON.stringify(normalizedTodos) !== JSON.stringify(approvedTodoList)
 			if (isTodoListChanged) {
 				normalizedTodos = approvedTodoList ?? []
-				task.say(
-					"user_edit_todos",
-					JSON.stringify({
-						tool: "updateTodoList",
-						todos: normalizedTodos,
-					}),
-				)
+				// Non-blocking: a failed notification must not abort persisting the edited list.
+				void task
+					.say(
+						"user_edit_todos",
+						JSON.stringify({
+							tool: "updateTodoList",
+							todos: normalizedTodos,
+						}),
+					)
+					.catch((error) => {
+						console.error("[UpdateTodoListTool] Failed to post user_edit_todos:", error)
+					})
 			}
 
 			await setTodoListForTask(task, normalizedTodos)
@@ -104,45 +109,6 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 		})
 		await task.ask("tool", approvalMsg, block.partial).catch(() => {})
 	}
-}
-
-export function addTodoToTask(cline: Task, content: string, status: TodoStatus = "pending", id?: string): TodoItem {
-	const todo: TodoItem = {
-		id: id ?? crypto.randomUUID(),
-		content,
-		status,
-	}
-	if (!cline.todoList) cline.todoList = []
-	cline.todoList.push(todo)
-	return todo
-}
-
-export function updateTodoStatusForTask(cline: Task, id: string, nextStatus: TodoStatus): boolean {
-	if (!cline.todoList) return false
-	const idx = cline.todoList.findIndex((t) => t.id === id)
-	if (idx === -1) return false
-	const current = cline.todoList[idx]
-	if (
-		(current.status === "pending" && nextStatus === "in_progress") ||
-		(current.status === "in_progress" && nextStatus === "completed") ||
-		current.status === nextStatus
-	) {
-		cline.todoList[idx] = { ...current, status: nextStatus }
-		return true
-	}
-	return false
-}
-
-export function removeTodoFromTask(cline: Task, id: string): boolean {
-	if (!cline.todoList) return false
-	const idx = cline.todoList.findIndex((t) => t.id === id)
-	if (idx === -1) return false
-	cline.todoList.splice(idx, 1)
-	return true
-}
-
-export function getTodoListForTask(cline: Task): TodoItem[] | undefined {
-	return cline.todoList?.slice()
 }
 
 export async function setTodoListForTask(cline?: Task, todos?: TodoItem[]) {

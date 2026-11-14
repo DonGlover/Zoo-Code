@@ -112,14 +112,14 @@ export const Poe = ({
 
 		vscode.postMessage({
 			type: RouterModelsMessageType.requestRouterModels,
-			values: { poeApiKey: key, poeBaseUrl: apiConfiguration.poeBaseUrl },
+			values: { provider: providerIdentifiers.poe, poeApiKey: key, poeBaseUrl: apiConfiguration.poeBaseUrl },
 		})
 	}, [apiConfiguration, t])
 
 	return (
 		<>
 			<VSCodeTextField
-				value={apiConfiguration?.poeApiKey || ""}
+				value={apiConfiguration.poeApiKey || ""}
 				type="password"
 				onInput={handleInputChange("poeApiKey")}
 				placeholder={t("settings:placeholders.apiKey")}
@@ -129,7 +129,7 @@ export const Poe = ({
 			<div className="text-sm text-vscode-descriptionForeground -mt-2">
 				{t("settings:providers.apiKeyStorageNotice")}
 			</div>
-			{!apiConfiguration?.poeApiKey && (
+			{!apiConfiguration.poeApiKey && (
 				<VSCodeButtonLink href="https://poe.com/api_key" appearance="secondary">
 					{t("settings:providers.getPoeApiKey")}
 				</VSCodeButtonLink>

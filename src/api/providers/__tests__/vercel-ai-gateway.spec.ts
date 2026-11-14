@@ -51,6 +51,18 @@ vitest.mock("../fetchers/modelCache", () => ({
 				cacheReadsPrice: 1,
 				description: "Claude Fable 5",
 			},
+			"anthropic/claude-fable-5.1": {
+				maxTokens: 128000,
+				contextWindow: 1000000,
+				supportsImages: true,
+				supportsPromptCache: true,
+				supportsTemperature: false,
+				inputPrice: 10,
+				outputPrice: 50,
+				cacheWritesPrice: 12.5,
+				cacheReadsPrice: 0.25,
+				description: "Claude Fable 5.1",
+			},
 			"anthropic/claude-sonnet-5": {
 				maxTokens: 128000,
 				contextWindow: 1000000,
@@ -86,6 +98,22 @@ vitest.mock("../fetchers/modelCache", () => ({
 				cacheReadsPrice: 0.1,
 				description: "Claude 3.5 Haiku",
 			},
+			// The real gateway catalog never sets `promptCacheTtlSupport`, so this row
+			// exists only to inject the capability the accept path needs. It is kept
+			// separate from the shared haiku row so the reject-path test keeps a model
+			// with no TTL capability.
+			"anthropic/claude-3.5-sonnet": {
+				maxTokens: 8192,
+				contextWindow: 200000,
+				supportsImages: true,
+				supportsPromptCache: true,
+				promptCacheTtlSupport: ["1h"],
+				inputPrice: 3,
+				outputPrice: 15,
+				cacheWritesPrice: 3.75,
+				cacheReadsPrice: 0.3,
+				description: "Claude 3.5 Sonnet",
+			},
 			"openai/gpt-4o": {
 				maxTokens: 16000,
 				contextWindow: 128000,
@@ -97,7 +125,21 @@ vitest.mock("../fetchers/modelCache", () => ({
 				cacheReadsPrice: 0.25,
 				description: "GPT-4o",
 			},
+			"openai/gpt-6-astra": {
+				maxTokens: 128000,
+				contextWindow: 1050000,
+				supportsImages: true,
+				supportsPromptCache: true,
+				supportsReasoningEffort: ["low", "medium", "high", "xhigh", "max"],
+				requiredReasoningEffort: true,
+				reasoningEffort: "medium",
+				supportsTemperature: false,
+			},
 		})
+	}),
+	refreshModels: vitest.fn(async (options, handler) => {
+		const { getModels } = await import("../fetchers/modelCache")
+		return getModels(options, handler)
 	}),
 	getModelsFromCache: vitest.fn().mockReturnValue(undefined),
 }))
@@ -324,6 +366,24 @@ describe("VercelAiGatewayHandler", () => {
 			)
 		})
 
+		it("omits temperature for Claude Fable 5.1", async () => {
+			const handler = new VercelAiGatewayHandler(
+				makeApiHandlerOptions({
+					...mockOptions,
+					vercelAiGatewayModelId: "anthropic/claude-fable-5.1",
+				}),
+			)
+
+			await collectStream(handler.createMessage("system prompt", [{ role: "user", content: "test" }]))
+
+			expect(mockCreate).toHaveBeenCalledWith(
+				expect.objectContaining({
+					model: "anthropic/claude-fable-5.1",
+					temperature: undefined,
+				}),
+			)
+		})
+
 		it("omits temperature for Claude Sonnet 5", async () => {
 			const handler = new VercelAiGatewayHandler(
 				makeApiHandlerOptions({
@@ -364,6 +424,30 @@ describe("VercelAiGatewayHandler", () => {
 			expect(call.max_completion_tokens).toBe(128000)
 		})
 
+		it.each([
+			["max", "max"],
+			["none", "medium"],
+		] as const)("uses safe Astra request parameters for %s reasoning", async (reasoningEffort, expectedEffort) => {
+			const handler = new VercelAiGatewayHandler(
+				makeApiHandlerOptions({
+					...mockOptions,
+					vercelAiGatewayModelId: "openai/gpt-6-astra",
+					modelTemperature: 0.7,
+					reasoningEffort,
+				}),
+			)
+
+			await handler.createMessage("You are a helpful assistant.", [{ role: "user", content: "Hello" }]).next()
+
+			const call = mockCreate.mock.calls[mockCreate.mock.calls.length - 1][0]
+			expect(call).toMatchObject({
+				model: "openai/gpt-6-astra",
+				max_completion_tokens: 128000,
+				reasoning_effort: expectedEffort,
+			})
+			expect(call.temperature).toBeUndefined()
+		})
+
 		it("adds cache breakpoints for supported models", async () => {
 			const { addCacheBreakpoints } = await import("../../transform/caching/vercel-ai-gateway")
 			const handler = new VercelAiGatewayHandler(
@@ -379,6 +463,47 @@ describe("VercelAiGatewayHandler", () => {
 			await handler.createMessage(systemPrompt, messages).next()
 
 			expect(addCacheBreakpoints).toHaveBeenCalled()
+		})
+
+		it("does not emit a ttl for a gateway model with no TTL capability", async () => {
+			// The gateway catalog is fetched at runtime and carries no TTL capability,
+			// so a 1h knob must fail closed (ADR-0006 I2).
+			const { addCacheBreakpoints } = await import("../../transform/caching/vercel-ai-gateway")
+			const handler = new VercelAiGatewayHandler(
+				makeApiHandlerOptions({
+					...mockOptions,
+					vercelAiGatewayModelId: "anthropic/claude-3.5-haiku",
+					promptCacheTtl: "1h",
+				}),
+			)
+
+			await handler.createMessage("You are a helpful assistant.", [{ role: "user", content: "Hello" }]).next()
+
+			// `addCacheBreakpoints` is file-mocked, so the request body never receives
+			// `cache_control` and `JSON.stringify(mockCreate...)` cannot see the TTL.
+			// The TTL only exists as the third argument to the mocked call.
+			expect(addCacheBreakpoints).toHaveBeenCalled()
+			const lastCall = vitest.mocked(addCacheBreakpoints).mock.calls.at(-1)
+			expect(lastCall).toBeDefined()
+			expect(lastCall![2]).toBeUndefined()
+		})
+
+		it("passes the resolved ttl for a gateway model with 1h TTL capability", async () => {
+			// The runtime catalog never sets `promptCacheTtlSupport`, so the accept path is
+			// only reachable with an injected capability. The dedicated catalog row keeps
+			// the reject-path model capability-free.
+			const { addCacheBreakpoints } = await import("../../transform/caching/vercel-ai-gateway")
+			const handler = new VercelAiGatewayHandler(
+				makeApiHandlerOptions({
+					...mockOptions,
+					vercelAiGatewayModelId: "anthropic/claude-3.5-sonnet",
+					promptCacheTtl: "1h",
+				}),
+			)
+
+			await handler.createMessage("You are a helpful assistant.", [{ role: "user", content: "Hello" }]).next()
+
+			expect(vitest.mocked(addCacheBreakpoints).mock.calls.at(-1)![2]).toBe("1h")
 		})
 
 		it("sets correct max_completion_tokens", async () => {
@@ -722,6 +847,13 @@ describe("VercelAiGatewayHandler", () => {
 					temperature: 0.9,
 				}),
 			)
+		})
+	})
+
+	describe("model catalog", () => {
+		it("reports its cache scope", () => {
+			const handler = new VercelAiGatewayHandler(mockOptions)
+			expect(handler.getModelCacheScope()).toEqual({ urlScoped: false, keyScoped: false, authScoped: false })
 		})
 	})
 })

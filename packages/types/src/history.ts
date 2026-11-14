@@ -1,8 +1,30 @@
 import { z } from "zod"
 
+import { todoItemSchema } from "./todo.js"
+
 /**
  * HistoryItem
  */
+
+export const pendingTaskActionSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("create_subtask"),
+		actionId: z.string(),
+		approvalText: z.string(),
+		mode: z.string(),
+		message: z.string(),
+		todos: z.array(todoItemSchema),
+	}),
+	z.object({
+		kind: z.literal("finish_subtask"),
+		actionId: z.string(),
+		approvalText: z.string(),
+		parentTaskId: z.string(),
+		result: z.string(),
+	}),
+])
+
+export type PendingTaskAction = z.infer<typeof pendingTaskActionSchema>
 
 export const historyItemSchema = z.object({
 	id: z.string(),
@@ -11,6 +33,8 @@ export const historyItemSchema = z.object({
 	number: z.number(),
 	ts: z.number(),
 	task: z.string(),
+	title: z.string().optional(), // User-assigned display name; `task` keeps the original prompt
+	autoTitle: z.string().optional(), // Generated display name; `title` (manual) takes precedence
 	tokensIn: z.number(),
 	tokensOut: z.number(),
 	cacheWrites: z.number().optional(),
@@ -26,6 +50,7 @@ export const historyItemSchema = z.object({
 	awaitingChildId: z.string().optional(), // Child currently awaited (set when delegated)
 	completedByChildId: z.string().optional(), // Child that completed and resumed this parent
 	completionResultSummary: z.string().optional(), // Summary from completed child
+	pendingAction: pendingTaskActionSchema.optional(),
 })
 
 export type HistoryItem = z.infer<typeof historyItemSchema>

@@ -8,6 +8,8 @@ import { TaskScheduler } from "../core/task/TaskScheduler"
 import { type Task } from "../core/task/Task"
 import { API } from "../extension/api"
 import * as ProfileValidatorMod from "../shared/ProfileValidator"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import { makeClineProviderFactory } from "../test-utils/provider"
 
 type PrivateClineProviderMethods = {
 	createTask: (
@@ -45,7 +47,7 @@ vi.mock("../core/task/Task", () => {
 		}) {
 			this.taskId = opts.historyItem?.id ?? `task-${Math.random().toString(36).slice(2, 8)}`
 			this.parentTask = opts.parentTask
-			this.apiConfiguration = opts.apiConfiguration ?? { apiProvider: "anthropic" }
+			this.apiConfiguration = opts.apiConfiguration ?? { apiProvider: providerIdentifiers.anthropic }
 			opts.onCreated?.(this)
 		}
 		start() {}
@@ -86,7 +88,7 @@ describe("Single-open-task invariant", () => {
 			},
 			setValues: vi.fn(),
 			getState: vi.fn().mockResolvedValue({
-				apiConfiguration: { apiProvider: "anthropic", consecutiveMistakeLimit: 0 },
+				apiConfiguration: { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 0 },
 				organizationAllowList: "*",
 				enableCheckpoints: true,
 				checkpointTimeout: 60,
@@ -130,7 +132,7 @@ describe("Single-open-task invariant", () => {
 			taskScheduler: new TaskScheduler(),
 			setValues: vi.fn(),
 			getState: vi.fn().mockResolvedValue({
-				apiConfiguration: { apiProvider: "anthropic", consecutiveMistakeLimit: 0 },
+				apiConfiguration: { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 0 },
 				organizationAllowList: "*",
 				enableCheckpoints: true,
 				checkpointTimeout: 60,
@@ -182,7 +184,7 @@ describe("Single-open-task invariant", () => {
 				listConfig: vi.fn().mockResolvedValue([]),
 			},
 			getState: vi.fn().mockResolvedValue({
-				apiConfiguration: { apiProvider: "anthropic", consecutiveMistakeLimit: 0 },
+				apiConfiguration: { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 0 },
 				enableCheckpoints: true,
 				checkpointTimeout: 60,
 				experiments: {},
@@ -256,7 +258,7 @@ describe("Single-open-task invariant", () => {
 				listConfig: vi.fn().mockResolvedValue([]),
 			},
 			getState: vi.fn().mockResolvedValue({
-				apiConfiguration: { apiProvider: "anthropic", consecutiveMistakeLimit: 0 },
+				apiConfiguration: { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 0 },
 				enableCheckpoints: true,
 				checkpointTimeout: 60,
 				experiments: {},
@@ -328,7 +330,7 @@ describe("Single-open-task invariant", () => {
 				listConfig: vi.fn().mockResolvedValue([]),
 			},
 			getState: vi.fn().mockResolvedValue({
-				apiConfiguration: { apiProvider: "anthropic", consecutiveMistakeLimit: 0 },
+				apiConfiguration: { apiProvider: providerIdentifiers.anthropic, consecutiveMistakeLimit: 0 },
 				enableCheckpoints: true,
 				checkpointTimeout: 60,
 				experiments: {},
@@ -396,7 +398,7 @@ describe("Single-open-task invariant", () => {
 			createTask,
 			getValues: vi.fn(() => ({})),
 			providerSettingsManager: { saveConfig: vi.fn() },
-			on: vi.fn((ev: unknown, cb: unknown) => {
+			on: vi.fn((ev: unknown, _cb: unknown) => {
 				if (ev === "taskCreated") {
 					// no-op for this test
 				}
@@ -405,7 +407,7 @@ describe("Single-open-task invariant", () => {
 		} as unknown as ClineProvider
 
 		const output = { appendLine: vi.fn() } as unknown as OutputChannel
-		const api = new API(output, provider, undefined, false)
+		const api = new API(output, provider, makeClineProviderFactory(), undefined, false)
 
 		const taskId = await api.startNewTask({
 			configuration: {},
@@ -417,5 +419,14 @@ describe("Single-open-task invariant", () => {
 		expect(taskId).toBe("ipc-1")
 		expect(removeClineFromStack).toHaveBeenCalledTimes(1)
 		expect(createTask).toHaveBeenCalled()
+		// API tasks have no reachable hard stop, so the soft repetition tier
+		// must be disabled rather than soft-blocking forever.
+		expect(createTask).toHaveBeenCalledWith(
+			"hello",
+			undefined,
+			undefined,
+			expect.objectContaining({ consecutiveMistakeLimit: Number.MAX_SAFE_INTEGER, toolRepetitionSoftLimit: 0 }),
+			{},
+		)
 	})
 })

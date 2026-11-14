@@ -14,6 +14,18 @@ export const telemetrySettingsSchema = z.enum(telemetrySettings)
 export type TelemetrySetting = z.infer<typeof telemetrySettingsSchema>
 
 /**
+ * Whether telemetry should be captured for this install.
+ *
+ * Telemetry is on by default (disclosed opt-out): "unset" (no choice made yet) and
+ * "enabled" both mean telemetry may be captured. Only an explicit "disabled" opts out.
+ * The consent banner's dismiss/close action never writes a setting, so it stays neutral --
+ * it just leaves the default in effect rather than recording an affirmative choice either way.
+ */
+export function isTelemetryOptedIn(telemetrySetting: TelemetrySetting | undefined): boolean {
+	return telemetrySetting !== "disabled"
+}
+
+/**
  * TelemetryEventName
  */
 
@@ -74,6 +86,8 @@ export enum TelemetryEventName {
 	TELEMETRY_SETTINGS_CHANGED = "Telemetry Settings Changed",
 	MODEL_CACHE_EMPTY_RESPONSE = "Model Cache Empty Response",
 	READ_FILE_LEGACY_FORMAT_USED = "Read File Legacy Format Used",
+	RUN_STATE_DIVERGENCE = "Run State Divergence",
+	RUN_STATE_KNOWN_RACE = "Run State Known Race",
 }
 
 /**
@@ -210,6 +224,20 @@ export const rooCodeTelemetryEventSchema = z.discriminatedUnion("type", [
 		properties: telemetryPropertiesSchema,
 	}),
 	z.object({
+		type: z.enum([TelemetryEventName.RUN_STATE_DIVERGENCE, TelemetryEventName.RUN_STATE_KNOWN_RACE]),
+		properties: z.object({
+			...telemetryPropertiesSchema.shape,
+			taskId: z.string(),
+			kind: z.enum(["mismatch", "rejection"]),
+			raceId: z.string().optional(),
+			eventTag: z.string(),
+			mismatched: z.array(z.string()),
+			phase: z.string(),
+			streamTag: z.string(),
+			abort: z.boolean(),
+		}),
+	}),
+	z.object({
 		type: z.literal(TelemetryEventName.TELEMETRY_SETTINGS_CHANGED),
 		properties: z.object({
 			...telemetryPropertiesSchema.shape,
@@ -245,8 +273,7 @@ export type RooCodeTelemetryEvent = z.infer<typeof rooCodeTelemetryEventSchema>
  */
 
 export type TelemetryEventSubscription =
-	| { type: "include"; events: TelemetryEventName[] }
-	| { type: "exclude"; events: TelemetryEventName[] }
+	{ type: "include"; events: TelemetryEventName[] } | { type: "exclude"; events: TelemetryEventName[] }
 
 /**
  * TelemetryPropertiesProvider

@@ -23,6 +23,7 @@ describe("ContextWindowOverrideHandler", () => {
 			})),
 			getCondenseContextWindow: vi.fn(() => 200000),
 			countTokens: vi.fn(async () => 100),
+			getModelCacheScope: vi.fn(() => ({ urlScoped: false, keyScoped: false, authScoped: false })),
 		}
 
 		overrideHandler = new ContextWindowOverrideHandler(mockInnerHandler, 8000)

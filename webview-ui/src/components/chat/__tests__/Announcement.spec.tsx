@@ -1,7 +1,8 @@
 import React from "react"
 
-import { render, screen } from "@/utils/test-utils"
+import { fireEvent, render, screen } from "@/utils/test-utils"
 import { EXTERNAL_LINKS } from "@/constants/externalLinks"
+import { vscode } from "@/utils/vscode"
 
 import Announcement from "../Announcement"
 
@@ -13,16 +14,8 @@ vi.mock("@src/utils/vscode", () => ({
 
 vi.mock("@roo/package", () => ({
 	Package: {
-		version: "3.78.0",
+		version: "3.90.0",
 	},
-}))
-
-vi.mock("@vscode/webview-ui-toolkit/react", () => ({
-	VSCodeLink: ({ children, href, onClick, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
-		<a href={href} onClick={onClick} {...props}>
-			{children}
-		</a>
-	),
 }))
 
 vi.mock("react-i18next", () => ({
@@ -39,17 +32,16 @@ vi.mock("@src/i18n/TranslationContext", () => ({
 	useAppTranslation: () => ({
 		t: (key: string, options?: { version?: string }) => {
 			const translations: Record<string, string> = {
-				"chat:announcement.release.heading": "What's New:",
+				"chat:announcement.release.heading": "What is new in Zoo Code v3.90.0",
 				"chat:announcement.release.highlight1":
-					"Three major new models have arrived — use the brand-new Gemini 3.7 Flash, GLM 5.3, and Qwen3.8 Max models, plus updated DeepSeek V4 reasoning, pricing, and provider coverage.",
+					"✨ Providers and models: GitHub Copilot is now a provider: sign in and Zoo Code loads your Copilot models. IO Intelligence is a provider with its own API key. Gemini 4 Argon is on Gemini and Vertex. GPT-6 Luna is on OpenCode Go. Gemini 4 Argon and GPT-6 Luna are on Zoo Gateway as well.",
 				"chat:announcement.release.highlight2":
-					"Connect to NanoGPT — use dynamic model discovery, streaming and prompt completions, and routing preferences for speed, price, latency, throughput, tool support, and caching.",
+					"🧭 Tool execution: Repeating the same tool call gets a warning, then Zoo Code stops that loop. Disabling attempt_completion no longer leaves a task unable to finish. Queued messages run the same command-protection checks as commands you send directly.",
 				"chat:announcement.release.highlight3":
-					"More reliable providers and tasks — fixes improve Azure OpenAI endpoint setup, Kimi Code output limits, task-history title preservation, and Zoo settings import/export.",
-				"chat:announcement.handoff.heading": "The Roo Code plugin is not going away.",
+					"⚡ Reasoning and streaming: Anthropic adaptive thinking shows in chat, and thinking tokens are counted. The R1 toggle keeps reasoning from llama.cpp, Ollama, and LM Studio. Codex keeps encrypted reasoning with the summary you see. VS Code language-model streams use guarded recovery when a stream fails.",
 			}
 
-			if (key === "chat:announcement.title" || key === "chat:announcement.finalRelease.title") {
+			if (key === "chat:announcement.title") {
 				return `Zoo Code ${options?.version ?? ""} Released`
 			}
 
@@ -62,20 +54,21 @@ describe("Announcement", () => {
 	it("renders the announcement title and highlights", () => {
 		render(<Announcement hideAnnouncement={vi.fn()} />)
 
-		expect(screen.getByText("Zoo Code 3.78.0 Released")).toBeInTheDocument()
+		expect(screen.getByText("Zoo Code 3.90.0 Released")).toBeInTheDocument()
+		expect(screen.getByText("What is new in Zoo Code v3.90.0")).toBeInTheDocument()
 		expect(
 			screen.getByText(
-				"Three major new models have arrived — use the brand-new Gemini 3.7 Flash, GLM 5.3, and Qwen3.8 Max models, plus updated DeepSeek V4 reasoning, pricing, and provider coverage.",
+				"✨ Providers and models: GitHub Copilot is now a provider: sign in and Zoo Code loads your Copilot models. IO Intelligence is a provider with its own API key. Gemini 4 Argon is on Gemini and Vertex. GPT-6 Luna is on OpenCode Go. Gemini 4 Argon and GPT-6 Luna are on Zoo Gateway as well.",
 			),
 		).toBeInTheDocument()
 		expect(
 			screen.getByText(
-				"Connect to NanoGPT — use dynamic model discovery, streaming and prompt completions, and routing preferences for speed, price, latency, throughput, tool support, and caching.",
+				"🧭 Tool execution: Repeating the same tool call gets a warning, then Zoo Code stops that loop. Disabling attempt_completion no longer leaves a task unable to finish. Queued messages run the same command-protection checks as commands you send directly.",
 			),
 		).toBeInTheDocument()
 		expect(
 			screen.getByText(
-				"More reliable providers and tasks — fixes improve Azure OpenAI endpoint setup, Kimi Code output limits, task-history title preservation, and Zoo settings import/export.",
+				"⚡ Reasoning and streaming: Anthropic adaptive thinking shows in chat, and thinking tokens are counted. The R1 toggle keeps reasoning from llama.cpp, Ollama, and LM Studio. Codex keeps encrypted reasoning with the summary you see. VS Code language-model streams use guarded recovery when a stream fails.",
 			),
 		).toBeInTheDocument()
 	})
@@ -90,5 +83,60 @@ describe("Announcement", () => {
 		render(<Announcement hideAnnouncement={vi.fn()} />)
 
 		expect(screen.getByRole("link", { name: "GitHub" })).toHaveAttribute("href", EXTERNAL_LINKS.GITHUB_REPO)
+	})
+
+	it("posts each announcement link to the extension host exactly once", () => {
+		render(<Announcement hideAnnouncement={vi.fn()} />)
+
+		fireEvent.click(screen.getByRole("link", { name: "GitHub" }))
+		fireEvent.click(screen.getByRole("link", { name: "X" }))
+		fireEvent.click(screen.getByRole("link", { name: "Discord" }))
+		fireEvent.click(screen.getByRole("link", { name: "Reddit" }))
+
+		expect(vscode.postMessage).toHaveBeenCalledTimes(4)
+		expect(vscode.postMessage).toHaveBeenNthCalledWith(1, { type: "openExternal", url: EXTERNAL_LINKS.GITHUB_REPO })
+		expect(vscode.postMessage).toHaveBeenNthCalledWith(2, { type: "openExternal", url: "https://x.com/ZooCodeDev" })
+		expect(vscode.postMessage).toHaveBeenNthCalledWith(3, {
+			type: "openExternal",
+			url: "https://discord.gg/VxfP4Vx3gX",
+		})
+		expect(vscode.postMessage).toHaveBeenNthCalledWith(4, {
+			type: "openExternal",
+			url: "https://www.reddit.com/r/ZooCode/",
+		})
+	})
+
+	// VS Code's webview bootstrap intercepts clicks on any anchor with an href
+	// at the document level and never checks defaultPrevented, so the
+	// announcement links must stop propagation to avoid opening twice.
+	it("keeps announcement link clicks from reaching the document level", () => {
+		const documentClick = vi.fn()
+		document.addEventListener("click", documentClick)
+
+		try {
+			render(
+				<div>
+					<a href="#control">control</a>
+					<Announcement hideAnnouncement={vi.fn()} />
+				</div>,
+			)
+
+			fireEvent.click(screen.getByRole("link", { name: "GitHub" }))
+			expect(documentClick).not.toHaveBeenCalled()
+
+			fireEvent.click(screen.getByText("control"))
+			expect(documentClick).toHaveBeenCalledTimes(1)
+		} finally {
+			document.removeEventListener("click", documentClick)
+		}
+	})
+
+	it("hides the announcement when the dialog closes", () => {
+		const hideAnnouncement = vi.fn()
+		render(<Announcement hideAnnouncement={hideAnnouncement} />)
+
+		fireEvent.keyDown(document.body, { key: "Escape" })
+
+		expect(hideAnnouncement).toHaveBeenCalledTimes(1)
 	})
 })

@@ -4,42 +4,26 @@ import * as path from "path"
 import crypto from "crypto"
 
 import deepEqual from "fast-deep-equal"
-import type { HistoryItem } from "@roo-code/types"
+import { historyItemSchema, type HistoryItem } from "@roo-code/types"
 
 import { GlobalFileNames } from "../../shared/globalFileNames"
+import { LOCK_STALE_MS } from "../../utils/fileLock"
 import { safeWriteJson } from "../../utils/safeWriteJson"
+import { deleteJsonFile, recoverMissingJsonFile } from "../../utils/jsonFileRecovery"
+import { getErrorCode, readFileWithMissingRetry } from "./readFileWithMissingRetry"
 import { getStorageBasePath } from "../../utils/storage"
+import { assertValidTransition, settleRejectedCreateSubtaskAction, type HistoryItemStatus } from "./taskLifecycle"
+import { computeHistoryDelta, DeltaRejectedError, mergeHistoryDelta } from "./taskStoreConcurrency"
 
-/** Valid status values for a task's HistoryItem. */
-export type HistoryItemStatus = NonNullable<HistoryItem["status"]>
-
-const VALID_TRANSITIONS: Record<HistoryItemStatus, HistoryItemStatus[]> = {
-	active: ["delegated", "completed", "interrupted"],
-	delegated: ["active"],
-	interrupted: ["completed"],
-	completed: [],
-}
+export { assertValidTransition, type HistoryItemStatus } from "./taskLifecycle"
+export { DeltaRejectedError } from "./taskStoreConcurrency"
 
 /**
- * Asserts that a task status transition is valid, throwing if not.
- *
- * @throws {Error} When the transition is not allowed by the state machine.
+ * Build a `safeWriteJson` merge callback that applies only `delta` to the
+ * current disk state, preserving fields written by another process.
  */
-export function assertValidTransition(from: HistoryItemStatus | undefined, to: HistoryItemStatus): void {
-	const fromStatus: HistoryItemStatus = from ?? "active"
-	const validTargets = VALID_TRANSITIONS[fromStatus]
-	if (!validTargets.includes(to)) {
-		throw new Error(`Invalid task status transition: ${fromStatus} → ${to}`)
-	}
-}
-
-/**
- * Index file format for fast startup reads.
- */
-interface HistoryIndex {
-	version: number
-	updatedAt: number
-	entries: HistoryItem[]
+function mergeWithDisk(delta: Partial<HistoryItem>): (existing: unknown, incoming: unknown) => unknown {
+	return (existing, incoming) => mergeHistoryDelta(existing, incoming as HistoryItem, delta)
 }
 
 /**
@@ -75,16 +59,20 @@ interface DelegationRepairIntent {
  *
  * Each task's HistoryItem is stored as an individual JSON file in its
  * existing task directory (`globalStorage/tasks/<taskId>/history_item.json`).
- * A single index file (`globalStorage/tasks/_index.json`) is maintained
- * as a cache for fast list reads at startup.
+ * There is no shared index file. Reads scan the task directories.
  *
- * Cross-process safety comes from `safeWriteJson`'s `proper-lockfile`
- * on per-task file writes. Within a single extension host process,
- * an in-process write lock serializes mutations.
+ * Cross-process safety for per-task files comes from `safeWriteJson`'s
+ * `proper-lockfile` with a `merge` callback: each write reads the
+ * current file under the advisory lock and merges incoming fields, so
+ * a concurrent writer's changes are preserved rather than silently
+ * dropped. Within a single extension host process, an in-process write
+ * lock serializes mutations.
  */
 /**
  * Options for TaskHistoryStore constructor.
  */
+type AutoTitleDiskRead = { kind: "found"; item: HistoryItem } | { kind: "missing" } | { kind: "unreadable" }
+
 export interface TaskHistoryStoreOptions {
 	/**
 	 * Optional callback invoked inside the write lock after each mutation
@@ -100,7 +88,6 @@ export class TaskHistoryStore {
 	private cache: Map<string, HistoryItem> = new Map()
 	private taskFileMtimes: Map<string, number> = new Map()
 	private writeLock: Promise<void> = Promise.resolve()
-	private indexWriteTimer: ReturnType<typeof setTimeout> | null = null
 	private fsWatcher: fsSync.FSWatcher | null = null
 	private reconcileTimer: ReturnType<typeof setTimeout> | null = null
 	private disposed = false
@@ -111,9 +98,6 @@ export class TaskHistoryStore {
 	 */
 	public readonly initialized: Promise<void>
 	private resolveInitialized!: () => void
-
-	/** Debounce window for index writes in milliseconds. */
-	private static readonly INDEX_WRITE_DEBOUNCE_MS = 2000
 
 	/** Periodic reconciliation interval in milliseconds. */
 	private static readonly RECONCILE_INTERVAL_MS = 5 * 60 * 1000
@@ -129,37 +113,34 @@ export class TaskHistoryStore {
 	// ────────────────────────────── Lifecycle ──────────────────────────────
 
 	/**
-	 * Load index, reconcile if needed, start watchers.
+	 * Scan task files, reconcile delegation state, start watchers.
 	 */
 	async initialize(): Promise<void> {
 		try {
 			const tasksDir = await this.getTasksDir()
 			await fs.mkdir(tasksDir, { recursive: true })
 
-			// 1. Load existing index into the cache
-			await this.loadIndex()
-
-			// 2. Reconcile cache against actual task directories on disk
+			// 1. Scan task directories to populate the cache
 			await this.reconcile({ forceRefresh: true })
 			// Capture which active tasks were present in persisted state before replay can
 			// change any statuses. Reconciliation must not treat a replay-repaired parent
 			// as an orphaned active child in the same startup pass.
 			const persistedActiveIds = this.getPersistedActiveIds()
 
-			// 3. Complete any two-record repair interrupted after its intent was durable.
+			// 2. Complete any two-record repair interrupted after its intent was durable.
 			try {
 				await this.replayDelegationRepairIntent()
 			} catch (error) {
 				console.error("[TaskHistoryStore] Failed to replay delegation repair intent:", error)
 			}
 
-			// 4. Repair delegation inconsistencies left by a previous crash
+			// 3. Repair delegation inconsistencies left by a previous crash
 			await this.reconcileDelegationState(persistedActiveIds)
 
-			// 5. Start fs.watch for cross-instance reactivity
+			// 4. Start fs.watch for cross-instance reactivity
 			this.startWatcher()
 
-			// 6. Start periodic reconciliation as a defensive fallback
+			// 5. Start periodic reconciliation as a defensive fallback
 			this.startPeriodicReconciliation()
 		} finally {
 			// Mark initialization as complete so callers awaiting `initialized` can proceed
@@ -173,11 +154,6 @@ export class TaskHistoryStore {
 	dispose(): void {
 		this.disposed = true
 
-		if (this.indexWriteTimer) {
-			clearTimeout(this.indexWriteTimer)
-			this.indexWriteTimer = null
-		}
-
 		if (this.reconcileTimer) {
 			clearTimeout(this.reconcileTimer)
 			this.reconcileTimer = null
@@ -187,11 +163,6 @@ export class TaskHistoryStore {
 			this.fsWatcher.close()
 			this.fsWatcher = null
 		}
-
-		// Synchronously flush the index (best-effort)
-		this.flushIndex().catch((err) => {
-			console.error("[TaskHistoryStore] Error flushing index on dispose:", err)
-		})
 	}
 
 	// ────────────────────────────── Reads ──────────────────────────────
@@ -222,8 +193,8 @@ export class TaskHistoryStore {
 	/**
 	 * Insert or update a history item.
 	 *
-	 * Writes the per-task file immediately (source of truth),
-	 * updates the in-memory Map, and schedules a debounced index write.
+	 * Writes the per-task file immediately (source of truth)
+	 * and updates the in-memory cache.
 	 */
 	async upsert(item: HistoryItem): Promise<HistoryItem[]> {
 		return this.withLock(() => this.upsertCore(item))
@@ -250,20 +221,40 @@ export class TaskHistoryStore {
 		if (!options.skipTransitionCheck && existing && item.status !== undefined) {
 			const normalizedExisting: HistoryItemStatus = existing.status ?? "active"
 			if (item.status !== normalizedExisting) {
-				assertValidTransition(existing.status, item.status)
+				try {
+					assertValidTransition(existing.status, item.status)
+				} catch (cacheError) {
+					// Cache may be stale from a peer write. Re-read disk
+					// under the store lock before rejecting the transition.
+					const diskItem = await this.readTaskFile(item.id)
+					if (!diskItem) {
+						throw cacheError
+					}
+					assertValidTransition(diskItem.status, item.status)
+				}
 			}
 		}
 
 		// Merge: preserve existing metadata unless explicitly overwritten
 		const merged = existing ? { ...existing, ...item } : item
 
-		// Write per-task file (source of truth)
-		await this.writeTaskFile(merged)
+		const delta = existing ? this.buildDelta(item.id, existing, item) : { ...item }
+		let written: HistoryItem
+		try {
+			written = await this.writeTaskFile(merged, delta)
+		} catch (error) {
+			if (error instanceof DeltaRejectedError) {
+				const diskItem = await this.readTaskFile(item.id)
+				if (diskItem) {
+					this.cache.set(item.id, diskItem)
+				}
+				throw error
+			}
+			throw error
+		}
 
-		// Update in-memory cache
-		this.cache.set(merged.id, merged)
-		// Schedule debounced index write
-		this.scheduleIndexWrite()
+		// Update in-memory cache with what was actually persisted
+		this.cache.set(written.id, written)
 
 		const all = this.getAll()
 
@@ -277,6 +268,13 @@ export class TaskHistoryStore {
 
 	/**
 	 * Delete a single task's history item.
+	 *
+	 * Deletion is best-effort: the unlink runs under the same per-file
+	 * advisory lock as `safeWriteJson`, so a locked read-modify-write (for
+	 * example the settlement in `clearPendingActionIfMatching`) cannot
+	 * interleave with it. A lock or unlink failure is swallowed because the
+	 * file may already be deleted; the in-memory eviction and the write
+	 * through still complete.
 	 */
 	async delete(taskId: string): Promise<void> {
 		return this.withLock(async () => {
@@ -286,12 +284,12 @@ export class TaskHistoryStore {
 			// Remove per-task file (best-effort)
 			try {
 				const filePath = await this.getTaskFilePath(taskId)
-				await fs.unlink(filePath)
-			} catch {
+				await deleteJsonFile(filePath)
+			} catch (error) {
+				if (getErrorCode(error) !== "ENOENT")
+					console.warn("[TaskHistoryStore] Failed to delete task history:", error)
 				// File may already be deleted
 			}
-
-			this.scheduleIndexWrite()
 
 			// Call onWrite callback inside the lock for serialized write-through
 			if (this.onWrite) {
@@ -302,6 +300,10 @@ export class TaskHistoryStore {
 
 	/**
 	 * Delete multiple tasks' history items in a batch.
+	 *
+	 * Every item follows the `delete` semantics and is attempted even when an
+	 * earlier unlink fails. The single write-through runs once after the
+	 * whole batch.
 	 */
 	async deleteMany(taskIds: string[]): Promise<void> {
 		return this.withLock(async () => {
@@ -309,15 +311,16 @@ export class TaskHistoryStore {
 				this.cache.delete(taskId)
 				this.taskFileMtimes.delete(taskId)
 
+				// Remove per-task file (best-effort)
 				try {
 					const filePath = await this.getTaskFilePath(taskId)
-					await fs.unlink(filePath)
-				} catch {
+					await deleteJsonFile(filePath)
+				} catch (error) {
+					if (getErrorCode(error) !== "ENOENT")
+						console.warn("[TaskHistoryStore] Failed to delete task history:", error)
 					// File may already be deleted
 				}
 			}
-
-			this.scheduleIndexWrite()
 
 			// Call onWrite callback inside the lock for serialized write-through
 			if (this.onWrite) {
@@ -329,7 +332,7 @@ export class TaskHistoryStore {
 	// ────────────────────────────── Reconciliation ──────────────────────────────
 
 	/**
-	 * Scan task directories vs index and fix any drift.
+	 * Scan task directories and fix any drift between disk and cache.
 	 *
 	 * - Tasks on disk but missing from cache: read and add
 	 * - Tasks in cache but missing from disk: remove
@@ -346,20 +349,22 @@ export class TaskHistoryStore {
 				return // tasks dir doesn't exist yet
 			}
 
-			// Filter out the index file and hidden files
+			// Filter out hidden and reserved names
 			const taskDirNames = dirEntries.filter((name) => !name.startsWith("_") && !name.startsWith("."))
 
 			const onDiskIds = new Set(taskDirNames)
 			const cacheIds = new Set(this.cache.keys())
-			let changed = false
+			const liveIds = new Set<string>()
 
-			// Task files are authoritative during startup. Later watcher and periodic
-			// reconciliations use mtime change detection to avoid rewriting the index when
-			// nothing changed on disk.
 			for (const taskId of onDiskIds) {
 				try {
 					const taskFilePath = await this.getTaskFilePath(taskId)
-					const { mtimeMs } = await fs.stat(taskFilePath)
+					const { mtimeMs } = await fs.stat(taskFilePath).catch(async (error: unknown) => {
+						if (getErrorCode(error) !== "ENOENT") throw error
+						await recoverMissingJsonFile(taskFilePath, { waitForStaleLock: false })
+						return fs.stat(taskFilePath)
+					})
+					liveIds.add(taskId)
 					if (
 						!options.forceRefresh &&
 						this.cache.has(taskId) &&
@@ -369,30 +374,41 @@ export class TaskHistoryStore {
 					}
 
 					const item = await this.readTaskFile(taskId)
-					if (item) {
+					if (item?.id === taskId) {
 						const previous = this.cache.get(taskId)
 						this.taskFileMtimes.set(taskId, mtimeMs)
 						if (!deepEqual(previous, item)) {
 							this.cache.set(taskId, item)
-							changed = true
 						}
 					}
-				} catch {
-					// Corrupted or missing file, skip
+				} catch (error) {
+					if (getErrorCode(error) !== "ENOENT") {
+						liveIds.add(taskId)
+						console.warn("[TaskHistoryStore] Failed to reconcile task history:", error)
+						continue
+					}
+					// File may be temporarily absent during a peer's atomic
+					// rename window in safeWriteJson. The advisory lock is
+					// held for the entire write, so its presence means a
+					// write is in progress — keep the task live.
+					try {
+						const lockPath = (await this.getTaskFilePath(taskId)) + ".lock"
+						const lockStat = await fs.stat(lockPath)
+						if (Date.now() - lockStat.mtimeMs < LOCK_STALE_MS) {
+							liveIds.add(taskId)
+						}
+					} catch {
+						// No lock file — file is genuinely absent
+					}
 				}
 			}
 
-			// Tasks in cache but not on disk: remove from cache
+			// Evict tasks whose history_item.json no longer exists
 			for (const taskId of cacheIds) {
-				if (!onDiskIds.has(taskId)) {
+				if (!liveIds.has(taskId)) {
 					this.cache.delete(taskId)
 					this.taskFileMtimes.delete(taskId)
-					changed = true
 				}
-			}
-
-			if (changed) {
-				this.scheduleIndexWrite()
 			}
 		})
 	}
@@ -428,7 +444,7 @@ export class TaskHistoryStore {
 	 * Reconcile delegation state while the store lock is already held.
 	 *
 	 * Callers that do not hold the lock must use `reconcileDelegationState()`.
-	 * Migration uses this core method so its cache/file/index updates and the
+	 * Migration uses this core method so its cache/file updates and the
 	 * follow-up repair remain one serialized operation without re-entering the
 	 * non-reentrant lock.
 	 */
@@ -584,12 +600,6 @@ export class TaskHistoryStore {
 				await this.onWrite(this.getAll())
 			}
 			await this.removeDelegationRepairIntent()
-			// Task files are authoritative and the intent is the recovery journal.
-			// Clean up the journal before scheduling the derived index: a crash after
-			// cleanup but before the index write is safe because startup rebuilds the
-			// index from task files, while the reverse ordering could make the index
-			// appear durable before recovery metadata is settled.
-			this.scheduleIndexWrite()
 		})
 	}
 
@@ -645,9 +655,6 @@ export class TaskHistoryStore {
 			await this.onWrite(this.getAll())
 		}
 		await this.removeDelegationRepairIntent()
-		// The index is derived state; keep the intent until authoritative task-file
-		// writes and write-through have completed, then schedule the index update.
-		this.scheduleIndexWrite()
 	}
 
 	private matchesDelegationRepairParentPreconditions(intent: DelegationRepairIntent, parent: HistoryItem): boolean {
@@ -670,7 +677,7 @@ export class TaskHistoryStore {
 		const intentPath = await this.getDelegationRepairIntentPath()
 		let parsed: unknown
 		try {
-			parsed = JSON.parse(await fs.readFile(intentPath, "utf8")) as unknown
+			parsed = JSON.parse(await readFileWithMissingRetry(intentPath)) as unknown
 		} catch (error) {
 			if (this.isFileNotFoundError(error)) {
 				return null
@@ -730,7 +737,7 @@ export class TaskHistoryStore {
 
 	private async removeDelegationRepairIntent(): Promise<void> {
 		try {
-			await fs.unlink(await this.getDelegationRepairIntentPath())
+			await deleteJsonFile(await this.getDelegationRepairIntentPath())
 		} catch (error) {
 			console.warn("[TaskHistoryStore] Failed to remove completed delegation repair intent:", error)
 		}
@@ -838,15 +845,23 @@ export class TaskHistoryStore {
 				try {
 					await fs.access(filePath)
 					// File already exists, skip (don't overwrite existing per-task files)
-				} catch {
-					// File doesn't exist, write it
-					await safeWriteJson(filePath, item)
-					this.cache.set(item.id, item)
+				} catch (error) {
+					if (getErrorCode(error) !== "ENOENT") throw error
+					// Recovery or a peer may supply a committed record after the access check.
+					let persisted = item
+					await safeWriteJson(filePath, item, {
+						merge: (existing) => {
+							if (existing !== null) {
+								const recovered = historyItemSchema.parse(existing)
+								if (recovered.id !== item.id) throw new Error("Migration task ID mismatch")
+								persisted = recovered
+							}
+							return persisted
+						},
+					})
+					this.cache.set(item.id, persisted)
 				}
 			}
-
-			// Write the index
-			await this.writeIndex()
 
 			// Repair any delegation inconsistencies introduced by the migrated entries.
 			// Run the lock-free core because migration already holds the store lock.
@@ -854,87 +869,44 @@ export class TaskHistoryStore {
 		})
 	}
 
-	// ────────────────────────────── Private: Index management ──────────────────────────────
-
-	/**
-	 * Load the `_index.json` file into the in-memory cache.
-	 */
-	private async loadIndex(): Promise<void> {
-		const indexPath = await this.getIndexPath()
-
-		try {
-			const raw = await fs.readFile(indexPath, "utf8")
-			const index: HistoryIndex = JSON.parse(raw)
-
-			if (index.version === 1 && Array.isArray(index.entries)) {
-				for (const entry of index.entries) {
-					if (entry.id) {
-						this.cache.set(entry.id, entry)
-					}
-				}
-			}
-		} catch {
-			// Index doesn't exist or is corrupted; cache stays empty.
-			// Reconciliation will rebuild it from per-task files.
-		}
-	}
-
-	/**
-	 * Write the full index to disk.
-	 */
-	private async writeIndex(): Promise<void> {
-		const indexPath = await this.getIndexPath()
-		const index: HistoryIndex = {
-			version: 1,
-			updatedAt: Date.now(),
-			entries: this.getAll(),
-		}
-
-		await safeWriteJson(indexPath, index)
-	}
-
-	/**
-	 * Schedule a debounced index write.
-	 */
-	private scheduleIndexWrite(): void {
-		if (this.disposed) {
-			return
-		}
-
-		if (this.indexWriteTimer) {
-			clearTimeout(this.indexWriteTimer)
-		}
-
-		this.indexWriteTimer = setTimeout(async () => {
-			this.indexWriteTimer = null
-			try {
-				await this.writeIndex()
-			} catch (err) {
-				console.error("[TaskHistoryStore] Failed to write index:", err)
-			}
-		}, TaskHistoryStore.INDEX_WRITE_DEBOUNCE_MS)
-	}
-
-	/**
-	 * Force an immediate index write (called on dispose/shutdown).
-	 */
-	async flushIndex(): Promise<void> {
-		if (this.indexWriteTimer) {
-			clearTimeout(this.indexWriteTimer)
-			this.indexWriteTimer = null
-		}
-
-		await this.writeIndex()
-	}
-
 	// ────────────────────────────── Private: Per-task file I/O ──────────────────────────────
 
 	/**
-	 * Write a HistoryItem to its per-task `history_item.json` file.
+	 * Return only the fields in `incoming` that differ from `cached`.
 	 */
-	private async writeTaskFile(item: HistoryItem): Promise<void> {
+	private computeDelta(cached: HistoryItem, incoming: Partial<HistoryItem>): Partial<HistoryItem> {
+		return computeHistoryDelta(cached, incoming)
+	}
+
+	private buildDelta(id: string, cached: HistoryItem, incoming: Partial<HistoryItem>): Partial<HistoryItem> {
+		return { id, ...this.computeDelta(cached, incoming) }
+	}
+
+	/**
+	 * Write a HistoryItem to its per-task `history_item.json` file.
+	 *
+	 * When `delta` is provided, the merge callback applies only the
+	 * delta to the current disk state, so fields written by another
+	 * process are preserved. Without a delta the full item is written
+	 * as-is (used by administrative repair paths that are authoritative).
+	 */
+	private async writeTaskFile(item: HistoryItem, delta?: Partial<HistoryItem>): Promise<HistoryItem> {
 		const filePath = await this.getTaskFilePath(item.id)
-		await safeWriteJson(filePath, item)
+		if (delta) {
+			let written: HistoryItem = item
+			const mergeFn = mergeWithDisk(delta)
+			await safeWriteJson(filePath, item, {
+				merge: (existing, incoming) => {
+					const result = mergeFn(existing, incoming)
+					written = result as HistoryItem
+					return result
+				},
+			})
+			return written
+		} else {
+			await safeWriteJson(filePath, item)
+			return item
+		}
 	}
 
 	/**
@@ -944,7 +916,7 @@ export class TaskHistoryStore {
 		const filePath = await this.getTaskFilePath(taskId)
 
 		try {
-			const raw = await fs.readFile(filePath, "utf8")
+			const raw = await readFileWithMissingRetry(filePath)
 			const item: HistoryItem = JSON.parse(raw)
 			return item.id ? item : null
 		} catch {
@@ -1055,10 +1027,117 @@ export class TaskHistoryStore {
 	}
 
 	/**
-	 * Atomically update two related HistoryItems within a single lock acquisition.
-	 * Both updaters run synchronously (no I/O, no lock re-entry). Both writes are
-	 * committed before the lock releases — no concurrent writer can observe an
-	 * intermediate state.
+	 * Record a generated title unless the task already has one. The persisted record is re-checked
+	 * under the per-file lock, so a task deleted by another host is never resurrected and a title
+	 * written by another host is never overwritten. Only a confirmed missing file evicts the cache:
+	 * a read or parse failure leaves it intact so a later save still merges against a known record.
+	 */
+	public setAutoTitleIfAbsent(taskId: string, autoTitle: string): Promise<{ applied: boolean; item?: HistoryItem }> {
+		return this.withLock(async () => {
+			const title = autoTitle.trim()
+			const disk = await this.readTaskFileForAutoTitle(taskId)
+			if (disk.kind !== "found") {
+				return this.settleSkippedAutoTitle(taskId, disk)
+			}
+			if (disk.item.autoTitle || !title) {
+				return this.settleSkippedAutoTitle(taskId, disk)
+			}
+
+			const skipped = Symbol("auto-title-skipped")
+			let persisted: HistoryItem | undefined
+			try {
+				const filePath = await this.getTaskFilePath(taskId)
+				await safeWriteJson(
+					filePath,
+					{ ...disk.item, autoTitle: title },
+					{
+						merge: (existing) => {
+							const current = existing as Partial<HistoryItem> | null
+							if (!current || current.id !== taskId || current.autoTitle) {
+								throw Object.assign(new Error("auto title skipped"), { [skipped]: true })
+							}
+							persisted = { ...(current as HistoryItem), autoTitle: title }
+							return persisted
+						},
+					},
+				)
+			} catch (error) {
+				if (!(error instanceof Error) || !(skipped in error)) {
+					throw error
+				}
+				// safeWriteJson reports both a missing and an unparsable file as `null`, so re-read to tell them apart.
+				return this.settleSkippedAutoTitle(taskId, await this.readTaskFileForAutoTitle(taskId))
+			}
+
+			if (!persisted) {
+				return { applied: false }
+			}
+			this.cacheAutoTitle(persisted)
+			if (this.onWrite) {
+				await this.onWrite(this.getAll())
+			}
+			return { applied: true, item: persisted }
+		})
+	}
+
+	/**
+	 * Copy only `autoTitle` from the disk record onto the cached one. The cache is the baseline that
+	 * later saves diff against, so taking the peer's other fields here would let a stale snapshot
+	 * from this host write its old values back over them. Callers still return the full disk record
+	 * for display.
+	 */
+	private cacheAutoTitle(disk: HistoryItem): void {
+		const cached = this.cache.get(disk.id)
+		this.cache.set(disk.id, cached ? { ...cached, autoTitle: disk.autoTitle } : disk)
+	}
+
+	private settleSkippedAutoTitle(taskId: string, disk: AutoTitleDiskRead): { applied: false; item?: HistoryItem } {
+		switch (disk.kind) {
+			case "found":
+				this.cacheAutoTitle(disk.item)
+				return { applied: false, item: disk.item }
+			case "missing":
+				this.cache.delete(taskId)
+				return { applied: false }
+			case "unreadable":
+				return { applied: false, item: this.cache.get(taskId) }
+		}
+	}
+
+	private async readTaskFileForAutoTitle(taskId: string): Promise<AutoTitleDiskRead> {
+		let raw: string
+		try {
+			raw = await readFileWithMissingRetry(await this.getTaskFilePath(taskId))
+		} catch (error) {
+			if (getErrorCode(error) === "ENOENT") {
+				return { kind: "missing" }
+			}
+			return this.unreadableForAutoTitle(taskId, error)
+		}
+		try {
+			const item: unknown = JSON.parse(raw)
+			const id = typeof item === "object" && item !== null ? (item as { id?: unknown }).id : undefined
+			if (id !== taskId) {
+				return this.unreadableForAutoTitle(taskId, `task file has id ${JSON.stringify(id)}`)
+			}
+			return { kind: "found", item: item as HistoryItem }
+		} catch (error) {
+			return this.unreadableForAutoTitle(taskId, error)
+		}
+	}
+
+	/** The caller only sees `applied: false`, so the reason is logged here. */
+	private unreadableForAutoTitle(taskId: string, reason: unknown): AutoTitleDiskRead {
+		console.warn(`[TaskHistoryStore] Failed to read task ${taskId} for auto title:`, reason)
+		return { kind: "unreadable" }
+	}
+
+	/**
+	 * Update two related HistoryItems within a single in-process lock acquisition.
+	 * Both updaters run synchronously (no I/O, no lock re-entry). Both writes
+	 * complete before the lock releases, so no in-process reader can observe an
+	 * intermediate state. Cross-process atomicity is NOT guaranteed — each
+	 * writeTaskFile call acquires and releases its own advisory file lock.
 	 *
 	 * @throws If either task ID is not present in the cache.
 	 */
@@ -1105,21 +1184,113 @@ export class TaskHistoryStore {
 			const mergedFirst = { ...first, ...updatedFirst }
 			const mergedSecond = { ...second, ...updatedSecond }
 
-			// Write both files before touching the cache so readers never observe a
-			// half-updated in-memory state between the two await points.
-			await this.writeTaskFile(mergedFirst)
-			await this.writeTaskFile(mergedSecond)
+			const writtenFirst = await this.writeTaskFile(mergedFirst, this.buildDelta(firstId, first, updatedFirst))
+			let writtenSecond: HistoryItem
+			try {
+				writtenSecond = await this.writeTaskFile(mergedSecond, this.buildDelta(secondId, second, updatedSecond))
+			} catch (error) {
+				// First record is committed on disk. Update cache so it
+				// reflects disk state before propagating the error.
+				this.cache.set(firstId, writtenFirst)
+				throw error
+			}
 
-			// Both disk writes succeeded — now update the cache atomically.
-			this.cache.set(firstId, mergedFirst)
-			this.cache.set(secondId, mergedSecond)
+			// Both disk writes succeeded — now update the cache.
+			this.cache.set(firstId, writtenFirst)
+			this.cache.set(secondId, writtenSecond)
 
-			this.scheduleIndexWrite()
 			const all = this.getAll()
 			if (this.onWrite) {
 				await this.onWrite(all)
 			}
 			return all
+		})
+	}
+
+	/**
+	 * Disk-authoritative compare-and-clear for a rejected `create_subtask`
+	 * pending action (#1714). The comparison runs inside the per-file
+	 * advisory lock's merge callback, so the decision reads the persisted
+	 * record rather than this store's possibly stale cache. Settlement goes
+	 * through the shared `settleRejectedCreateSubtaskAction` reducer, so a
+	 * completed record is never mutated and a missing, different-kind, or
+	 * replacement pending action is preserved unchanged. The authoritative
+	 * record is written back, the store cache is refreshed with it, and it
+	 * is returned to the caller.
+	 *
+	 * Deletion by another host is authoritative (#1726): when no persisted
+	 * record exists, the merge callback removes the stale cache entry and
+	 * throws instead of writing the cached record back to disk. A persisted
+	 * record must also match the canonical task-history schema and carry the
+	 * requested task ID; malformed or mismatched records drop the stale
+	 * cache entry and fail settlement closed without rewriting the record.
+	 *
+	 * @throws If the task ID is not present in the cache, no persisted record remains on disk,
+	 * or the persisted record is invalid or belongs to a different task ID.
+	 */
+	public async clearPendingActionIfMatching(taskId: string, expectedActionId: string): Promise<HistoryItem> {
+		return this.withLock(async () => {
+			const cached = this.cache.get(taskId)
+			if (!cached) {
+				throw new Error(`[TaskHistoryStore] clearPendingActionIfMatching: task ${taskId} not found in cache`)
+			}
+			const filePath = await this.getTaskFilePath(taskId)
+			let authoritative: HistoryItem = cached
+			let missingDiskRecord = false
+			try {
+				await safeWriteJson(filePath, cached, {
+					merge: (existing) => {
+						if (existing === null || existing === undefined) {
+							// Writing the cached record back would recreate a task
+							// another host deleted, so drop the stale entry first.
+							// A throwing merge writes nothing, so the deleted
+							// record stays deleted.
+							missingDiskRecord = true
+							this.cache.delete(taskId)
+							this.taskFileMtimes.delete(taskId)
+							throw new Error(
+								`[TaskHistoryStore] clearPendingActionIfMatching: task ${taskId} not found in cache`,
+							)
+						}
+						// Validate the locked disk record with the canonical
+						// task-history schema (#1726). Settlement must not
+						// rewrite malformed data and must not clear the action
+						// on a record persisted under a different task ID, so
+						// both cases drop the stale cache entry and fail
+						// closed without touching the disk record.
+						const parsed = historyItemSchema.safeParse(existing)
+						if (!parsed.success) {
+							this.cache.delete(taskId)
+							this.taskFileMtimes.delete(taskId)
+							throw new Error(
+								`[TaskHistoryStore] clearPendingActionIfMatching: task ${taskId} has an invalid disk record`,
+							)
+						}
+						if (parsed.data.id !== taskId) {
+							this.cache.delete(taskId)
+							this.taskFileMtimes.delete(taskId)
+							throw new Error(
+								`[TaskHistoryStore] clearPendingActionIfMatching: task ${taskId} has a disk record with mismatched id ${parsed.data.id}`,
+							)
+						}
+						const disk = existing as HistoryItem
+						authoritative = settleRejectedCreateSubtaskAction(disk, expectedActionId)
+						return authoritative
+					},
+				})
+			} catch (error) {
+				if (missingDiskRecord) {
+					throw new Error(
+						`[TaskHistoryStore] clearPendingActionIfMatching: task ${taskId} not found in cache`,
+					)
+				}
+				throw error
+			}
+			this.cache.set(taskId, authoritative)
+			if (this.onWrite) {
+				await this.onWrite(this.getAll())
+			}
+			return authoritative
 		})
 	}
 
@@ -1154,13 +1325,5 @@ export class TaskHistoryStore {
 	private async getTaskFilePath(taskId: string): Promise<string> {
 		const tasksDir = await this.getTasksDir()
 		return path.join(tasksDir, taskId, GlobalFileNames.historyItem)
-	}
-
-	/**
-	 * Get the path to the `_index.json` file.
-	 */
-	private async getIndexPath(): Promise<string> {
-		const tasksDir = await this.getTasksDir()
-		return path.join(tasksDir, GlobalFileNames.historyIndex)
 	}
 }

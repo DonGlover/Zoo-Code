@@ -4,14 +4,15 @@ import { Trans } from "react-i18next"
 import { Checkbox } from "vscrui"
 import { VSCodeLink, VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 
+import { useAppTranslation } from "@src/i18n/TranslationContext"
 import {
 	type ProviderSettings,
 	type ExtensionMessage,
 	type ModelRecord,
 	LmStudioModelsMessageType,
+	providerIdentifiers,
 } from "@roo-code/types"
 
-import { useAppTranslation } from "@src/i18n/TranslationContext"
 import { requestLmStudioModels } from "@src/components/ui/hooks/useLmStudioModels"
 import { useRouterModels } from "@src/components/ui/hooks/useRouterModels"
 
@@ -27,8 +28,8 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 	const { t } = useAppTranslation()
 
 	const [lmStudioModels, setLmStudioModels] = useState<ModelRecord>({})
-	const routerModels = useRouterModels()
-	const initialBaseUrlRef = useRef(apiConfiguration?.lmStudioBaseUrl)
+	const routerModels = useRouterModels({ provider: providerIdentifiers.lmstudio })
+	const initialBaseUrlRef = useRef(apiConfiguration.lmStudioBaseUrl)
 
 	const handleInputChange = useCallback(
 		<K extends keyof ProviderSettings, E>(
@@ -64,7 +65,7 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 
 	// Check if the selected model exists in the fetched models
 	const modelNotAvailableError = useMemo(() => {
-		const selectedModel = apiConfiguration?.lmStudioModelId
+		const selectedModel = apiConfiguration.lmStudioModelId
 		if (!selectedModel) return undefined
 
 		// Check if model exists in local LM Studio models
@@ -83,11 +84,11 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 
 		// If neither source has loaded yet, don't show warning
 		return undefined
-	}, [apiConfiguration?.lmStudioModelId, routerModels.data, lmStudioModels, t])
+	}, [apiConfiguration.lmStudioModelId, routerModels.data, lmStudioModels, t])
 
 	// Check if the draft model exists
 	const draftModelNotAvailableError = useMemo(() => {
-		const draftModel = apiConfiguration?.lmStudioDraftModelId
+		const draftModel = apiConfiguration.lmStudioDraftModelId
 		if (!draftModel) return undefined
 
 		// Check if model exists in local LM Studio models
@@ -106,12 +107,12 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 
 		// If neither source has loaded yet, don't show warning
 		return undefined
-	}, [apiConfiguration?.lmStudioDraftModelId, routerModels.data, lmStudioModels, t])
+	}, [apiConfiguration.lmStudioDraftModelId, routerModels.data, lmStudioModels, t])
 
 	return (
 		<>
 			<VSCodeTextField
-				value={apiConfiguration?.lmStudioBaseUrl || ""}
+				value={apiConfiguration.lmStudioBaseUrl || ""}
 				type="url"
 				onInput={handleInputChange("lmStudioBaseUrl")}
 				placeholder={t("settings:defaults.lmStudioUrl")}
@@ -130,13 +131,13 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 				hidePricing
 			/>
 			<Checkbox
-				checked={apiConfiguration?.lmStudioSpeculativeDecodingEnabled === true}
+				checked={apiConfiguration.lmStudioSpeculativeDecodingEnabled === true}
 				onChange={(checked) => {
 					setApiConfigurationField("lmStudioSpeculativeDecodingEnabled", checked)
 				}}>
 				{t("settings:providers.lmStudio.speculativeDecoding")}
 			</Checkbox>
-			{apiConfiguration?.lmStudioSpeculativeDecodingEnabled && (
+			{apiConfiguration.lmStudioSpeculativeDecodingEnabled && (
 				<>
 					<ModelPicker
 						apiConfiguration={apiConfiguration}
@@ -157,6 +158,7 @@ export const LMStudio = ({ apiConfiguration, setApiConfigurationField }: LMStudi
 			)}
 			<div className="text-sm text-vscode-descriptionForeground">
 				<Trans
+					t={t}
 					i18nKey="settings:providers.lmStudio.description"
 					components={{
 						a: <VSCodeLink href="https://lmstudio.ai/docs" />,

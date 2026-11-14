@@ -1,4 +1,4 @@
-import type { ModelInfo } from "../model.js"
+import { type ModelInfo } from "../model.js"
 
 // https://docs.litellm.ai/
 export const litellmDefaultModelId = "claude-3-7-sonnet-20250219"
@@ -55,6 +55,7 @@ export const LITELLM_PRESERVE_REASONING_MODEL_IDS = [
 	"glm-5.1",
 	"glm-5.2",
 	"glm-5.3",
+	"glm-5.3-flash",
 	"glm-5-turbo",
 
 	// bedrock.ts, minimax.ts, opencode-go.ts

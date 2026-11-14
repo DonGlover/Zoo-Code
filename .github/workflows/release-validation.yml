@@ -16,6 +16,12 @@ on:
             - "releases/**"
             - ".github/workflows/release-validation.yml"
 
+# Cancel superseded runs when a pull request is updated. Non-PR events keep
+# unique groups, so manual runs are never cancelled.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
     contents: read
 
@@ -27,7 +33,7 @@ jobs:
 
         steps:
             - name: Checkout code
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
             - name: Setup Node.js and pnpm
               uses: ./.github/actions/setup-node-pnpm

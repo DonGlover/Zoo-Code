@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react"
 import { getIconForFilePath, getIconUrlByName, getIconForDirectoryPath } from "vscode-material-icons"
 import { Trans } from "react-i18next"
-import { t } from "i18next"
+import { useAppTranslation } from "@src/i18n/TranslationContext"
 import { Settings } from "lucide-react"
 
 import type { ModeConfig, Command } from "@roo-code/types"
@@ -45,6 +45,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 	commands = [],
 }) => {
 	const [materialIconsBaseUri, setMaterialIconsBaseUri] = useState("")
+	const { t } = useAppTranslation()
 	const menuRef = useRef<HTMLDivElement>(null)
 
 	const filteredOptions = useMemo(() => {
@@ -81,7 +82,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 						style={{
 							fontWeight: "bold",
 							fontSize: "0.85em",
-							opacity: 0.8,
+							color: "var(--vscode-descriptionForeground)",
 						}}>
 						{option.label}
 					</span>
@@ -95,7 +96,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 						{option.description && (
 							<span
 								style={{
-									opacity: 0.5,
+									color: "var(--vscode-descriptionForeground)",
 									fontSize: "0.9em",
 									lineHeight: "1.2",
 									whiteSpace: "nowrap",
@@ -115,7 +116,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 							{option.argumentHint && (
 								<span
 									style={{
-										opacity: 0.5,
+										color: "var(--vscode-descriptionForeground)",
 										fontSize: "0.9em",
 										lineHeight: "1.2",
 									}}>
@@ -126,7 +127,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 						{option.description && (
 							<span
 								style={{
-									opacity: 0.5,
+									color: "var(--vscode-descriptionForeground)",
 									fontSize: "0.9em",
 									lineHeight: "1.2",
 									whiteSpace: "nowrap",
@@ -154,7 +155,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 							<span
 								style={{
 									fontSize: "0.85em",
-									opacity: 0.7,
+									color: "var(--vscode-descriptionForeground)",
 									whiteSpace: "nowrap",
 									overflow: "hidden",
 									textOverflow: "ellipsis",
@@ -197,7 +198,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 									direction: "rtl",
 									textAlign: "right",
 									flex: 1,
-									opacity: 0.75,
+									color: "var(--vscode-descriptionForeground)",
 									fontSize: "0.75em",
 								}}>
 								{folderPath}
@@ -297,6 +298,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
 								<p className="font-bold text-base text-vscode-foreground mt-1 mb-0.5">Slash Commands</p>
 								<p className="text-xs mt-0.5 -mb-1">
 									<Trans
+										t={t}
 										i18nKey="settings:slashCommands.description"
 										components={{
 											DocsLink: (

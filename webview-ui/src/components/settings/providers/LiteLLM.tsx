@@ -115,14 +115,14 @@ export const LiteLLM = ({
 
 		vscode.postMessage({
 			type: RouterModelsMessageType.requestRouterModels,
-			values: { litellmApiKey: key, litellmBaseUrl: url },
+			values: { provider: providerIdentifiers.litellm, litellmApiKey: key, litellmBaseUrl: url },
 		})
 	}, [apiConfiguration, setRefreshStatus, setRefreshError, t])
 
 	return (
 		<>
 			<VSCodeTextField
-				value={apiConfiguration?.litellmBaseUrl || ""}
+				value={apiConfiguration.litellmBaseUrl || ""}
 				onInput={handleInputChange("litellmBaseUrl")}
 				placeholder={t("settings:placeholders.baseUrl")}
 				className="w-full">
@@ -130,7 +130,7 @@ export const LiteLLM = ({
 			</VSCodeTextField>
 
 			<VSCodeTextField
-				value={apiConfiguration?.litellmApiKey || ""}
+				value={apiConfiguration.litellmApiKey || ""}
 				type="password"
 				onInput={handleInputChange("litellmApiKey")}
 				placeholder={t("settings:placeholders.apiKey")}
@@ -190,7 +190,7 @@ export const LiteLLM = ({
 			{(() => {
 				const selectedModelId = apiConfiguration.litellmModelId || litellmDefaultModelId
 				const selectedModel = routerModels?.litellm?.[selectedModelId]
-				if (selectedModel?.supportsPromptCache) {
+				if (selectedModel?.supportsPromptCache && !selectedModel.requiresResponsesApi) {
 					return (
 						<div className="mt-4">
 							<VSCodeCheckbox

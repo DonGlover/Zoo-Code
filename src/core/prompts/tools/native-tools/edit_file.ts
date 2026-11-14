@@ -18,7 +18,7 @@ const edit_file = {
 				old_string: {
 					type: "string",
 					description:
-						"The exact literal text to replace (must match the file contents exactly, including all whitespace and indentation). For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text. Use empty string to create a new file.",
+						"The exact literal text to replace (must match the file contents exactly, including all whitespace and indentation). For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text. Use empty string to create a new file. Do NOT include line-number prefixes (e.g. `137 | `) from `read_file` output — the file itself does not contain them.",
 				},
 				new_string: {
 					type: "string",
@@ -28,8 +28,7 @@ const edit_file = {
 				expected_replacements: {
 					type: "number",
 					description:
-						"Number of replacements expected. Defaults to 1 if not specified. Use when you want to replace multiple occurrences of the same text.",
-					minimum: 1,
+						"Number of replacements expected. Must be 1 or greater. Defaults to 1 if not specified. Use when you want to replace multiple occurrences of the same text.",
 				},
 			},
 			required: ["file_path", "old_string", "new_string"],

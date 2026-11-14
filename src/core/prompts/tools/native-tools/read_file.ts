@@ -61,9 +61,25 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): OpenAI.Ch
 	const { supportsImages = false } = options
 
 	// Build description based on capabilities
+	const descriptionIntro =
+		"Read a file and return its contents with line numbers for diffing or discussion. IMPORTANT: This tool reads exactly one file per call. If you need multiple files, issue multiple parallel read_file calls. NOTE: Line-number prefixes (e.g. `137 | `) are for reference only and do NOT exist in the raw file. Do NOT copy them into `old_string`, SEARCH blocks, or other edit inputs."
+
+	const modeDescription =
+		` Supports two modes: 'slice' (default) reads lines sequentially with offset/limit; 'indentation' extracts complete semantic code blocks around an anchor line based on indentation hierarchy.` +
+		` Slice mode is ideal for initial file exploration, understanding overall structure, reading configuration/data files, or when you need a specific line range. Use it when you don't have a target line number.` +
+		` PREFER indentation mode when you have a specific line number from search results, error messages, or definition lookups - it guarantees complete, syntactically valid code blocks without mid-function truncation.` +
+		` IMPORTANT: Indentation mode requires anchor_line to be useful. Without it, only header content (imports) is returned.`
+
+	const limitNote = ` By default, returns up to ${DEFAULT_LINE_LIMIT} lines per file. Lines longer than ${MAX_LINE_LENGTH} characters are truncated.`
+
 	const description =
-		"Read file contents with line numbers. Slice mode (default): sequential lines via offset/limit. Indentation mode: extract code blocks around anchor_line. " +
-		getReadFileSupportsNote(supportsImages)
+		descriptionIntro +
+		modeDescription +
+		limitNote +
+		" " +
+		getReadFileSupportsNote(supportsImages) +
+		` Example: { path: 'src/app.ts' }` +
+		` Example (indentation mode): { path: 'src/app.ts', mode: 'indentation', indentation: { anchor_line: 42 } }`
 
 	const indentationProperties: Record<string, unknown> = {
 		anchor_line: {
@@ -136,8 +152,3 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): OpenAI.Ch
 		},
 	} satisfies OpenAI.Chat.ChatCompletionTool
 }
-
-/**
- * Default read_file tool with all parameters
- */
-export const read_file = createReadFileTool()

@@ -1,15 +1,15 @@
 import * as vscode from "vscode"
 
-import { TodoItem } from "@roo-code/types"
+import type { PendingTaskAction, TodoItem } from "@roo-code/types"
 
 import { Task } from "../task/Task"
 import { getModeBySlug } from "../../shared/modes"
 import { formatResponse } from "../prompts/responses"
-import { t } from "../../i18n"
 import { parseMarkdownChecklist } from "./UpdateTodoListTool"
 import { Package } from "../../shared/package"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
+import { sanitizeToolUseId } from "../../utils/tool-id"
 
 interface NewTaskParams {
 	mode: string
@@ -22,7 +22,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 
 	async execute(params: NewTaskParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
 		const { mode, message, todos } = params
-		const { askApproval, handleError, pushToolResult } = callbacks
+		const { askApproval, handleError, pushToolResult, toolCallId } = callbacks
 
 		try {
 			// Validate required parameters.
@@ -52,8 +52,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 
 			const state = await provider.getState()
 
-			// Use Package.name (dynamic at build time) as the VSCode configuration namespace.
-			// Supports multiple extension variants (e.g., stable/nightly) without hardcoded strings.
+			// Use the package name as the VSCode configuration namespace.
 			const requireTodos = vscode.workspace
 				.getConfiguration(Package.name)
 				.get<boolean>("newTaskRequireTodos", false)
@@ -73,7 +72,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 			if (todos) {
 				try {
 					todoItems = parseMarkdownChecklist(todos)
-				} catch (error) {
+				} catch {
 					task.consecutiveMistakeCount++
 					task.recordToolError("new_task")
 					task.didToolFailInCurrentTurn = true
@@ -102,6 +101,19 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 				content: message,
 				todos: todoItems,
 			})
+			const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
+			if (pendingActionId) {
+				const pendingAction: PendingTaskAction = {
+					kind: "create_subtask",
+					actionId: pendingActionId,
+					approvalText: toolMessage,
+					mode,
+					message: unescapedMessage,
+					todos: todoItems,
+				}
+				await provider.setPendingTaskAction(task.taskId, pendingAction)
+				task.setPendingTaskAction(pendingAction)
+			}
 
 			const didApprove = await askApproval("tool", toolMessage)
 
@@ -115,6 +127,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 				message: unescapedMessage,
 				initialTodos: todoItems,
 				mode,
+				...(pendingActionId && { pendingActionId }),
 			})
 
 			// Reflect delegation in tool result (no pause/unpause, no wait)

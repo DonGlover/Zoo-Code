@@ -47,13 +47,11 @@ Zoo Code parteix de la base creada per Roo Code i continua ampliant-la amb:
 - **Fluxos de terminal i edició més fiables** — correccions per a la finalització prematura del terminal, les condicions de cursa en l'estat de les tasques, la gestió del context, l'edició de diff i l'ús d'eines específiques de cada proveïdor.
 - **Més control sobre el teu espai de treball** — gestió de regles, restriccions MCP per mode, controls de rutes multiarrel, opcions de raonament dels models i accions per revisar els canvis en completar una tasca.
 
-## Novetats a la v3.78.0
+## Novetats a la v3.96.0
 
-- **Han arribat tres grans models nous** — utilitza els nous Gemini 3.7 Flash, GLM 5.3 i Qwen3.8 Max, a més de millores en el raonament, els preus i la cobertura de proveïdors de DeepSeek V4.
-- **Connecta't a NanoGPT** — utilitza el descobriment dinàmic de models, streaming i completions de prompts, i preferències d'encaminament per velocitat, preu, latència, rendiment, compatibilitat amb eines i memòria cau.
-- **Proveïdors i tasques més fiables** — les correccions milloren la configuració dels endpoints d'Azure OpenAI, els límits de sortida de Kimi Code, la conservació dels títols de l'historial de tasques i la importació/exportació de configuració de Zoo.
-- Destructive Command Guard ara és compatible amb els Mac basats en Intel.
-- Les actualitzacions de seguretat solucionen vulnerabilitats a `undici` i Mermaid.
+- ✨ **Nous ajustos de xat i diagnòstics:** Mostra marques de temps als missatges amb formats d'hora i data configurables, ajusta el TTL de la cau de prompts per als perfils d'Anthropic i genera informes de diagnòstic que preserven la privacitat.
+- 💸 **Costos i cau dels proveïdors més precisos:** Manté intactes els resultats d'eines d'Anthropic, adopta els tokens de sortida acumulatius en els costos d'Anthropic i MiniMax, llegeix els comptadors de cau de prompts de DeepSeek, apunta a la cau de Responses de xAI i factura les lectures de cau de Mistral a 0,1x.
+- 🧭 **Xats més fiables i ràpids:** Repren les tasques completades després d'un reinici, restaura checkpoints quan falta el commit desat, recarrega automàticament un renderitzador de webview mort, regula les actualitzacions de streaming i carrega els idiomes sota demanda.
 
 ## Què pot fer Zoo Code per TU?
 

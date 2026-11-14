@@ -1,4 +1,13 @@
-import type { ModelInfo } from "../model.js"
+import { z } from "zod"
+
+import { type ModelInfo } from "../model.js"
+import { providerIdentifiers } from "../provider-identifiers.js"
+import {
+	API_MODEL_ID_FIELD,
+	apiModelIdProviderModelShape,
+	createModelIdAccessor,
+	createProviderDefinition,
+} from "./common.js"
 
 export type FireworksModelId =
 	| "accounts/fireworks/models/kimi-k2-instruct"
@@ -17,6 +26,7 @@ export type FireworksModelId =
 	| "accounts/fireworks/models/deepseek-v3p2"
 	| "accounts/fireworks/models/deepseek-v4-pro"
 	| "accounts/fireworks/models/deepseek-v4-pro-0813"
+	| "accounts/fireworks/models/deepseek-v4-flash-vision-exp"
 	| "accounts/fireworks/models/glm-4p5"
 	| "accounts/fireworks/models/glm-4p5-air"
 	| "accounts/fireworks/models/glm-4p6"
@@ -280,6 +290,19 @@ export const fireworksModels = {
 		description:
 			"DeepSeek V4 Pro 0813 is DeepSeek's production checkpoint for advanced reasoning, coding, and long-context agentic workloads.",
 	},
+	"accounts/fireworks/models/deepseek-v4-flash-vision-exp": {
+		displayName: "DeepSeek V4 Flash Vision Exp",
+		maxTokens: 384_000,
+		contextWindow: 1_048_576,
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsMaxTokens: true,
+		inputPrice: 0.22,
+		outputPrice: 0.66,
+		cacheReadsPrice: 0.007,
+		description:
+			"DeepSeek V4 Flash Vision Exp is an experimental multimodal model with text and image input, function calling, and long-context support.",
+	},
 	"accounts/fireworks/models/kimi-k2p7-code": {
 		maxTokens: 16384,
 		contextWindow: 262144,
@@ -306,3 +329,14 @@ export const fireworksModels = {
 			"Z.ai GLM-5.1 is the latest coding-focused model in the GLM family, with exceptional performance on complex programming tasks and enhanced reasoning and code generation quality.",
 	},
 } as const satisfies Record<string, ModelInfo>
+
+export const fireworksProviderDefinition = createProviderDefinition({
+	apiProvider: providerIdentifiers.fireworks,
+	modelIdKey: API_MODEL_ID_FIELD,
+	getModelId: createModelIdAccessor(API_MODEL_ID_FIELD),
+	getDefaultModelId: () => fireworksDefaultModelId,
+	schema: {
+		...apiModelIdProviderModelShape,
+		fireworksApiKey: z.string().optional(),
+	},
+})

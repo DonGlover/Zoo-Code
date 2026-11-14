@@ -156,10 +156,13 @@ async function testPowerShellCommand(
 		mockTerminalInfo.process = terminalProcess
 
 		// Get the event handlers from the mock
-		const eventHandlers = (vscode as any).__eventHandlers
+		// The vscode mock exposes its registered event handlers for manual firing.
+		const eventHandlers = (
+			vscode as typeof vscode & { __eventHandlers: Record<string, ((event: unknown) => void) | undefined> }
+		).__eventHandlers
 
 		// Execute the command first to set up the process
-		terminalProcess.run(command)
+		const runPromise = terminalProcess.run(command)
 
 		// Trigger the start terminal shell execution event through VSCode mock
 		if (eventHandlers.startTerminalShellExecution) {
@@ -208,6 +211,7 @@ async function testPowerShellCommand(
 
 		// Wait for the command to complete or timeout
 		await Promise.race([completedPromise, timeoutPromise])
+		await runPromise
 
 		// Calculate execution time in microseconds
 		if (!timeRecorded) {

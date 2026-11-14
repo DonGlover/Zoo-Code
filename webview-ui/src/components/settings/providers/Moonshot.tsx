@@ -101,7 +101,11 @@ export const Moonshot = ({ apiConfiguration, setApiConfigurationField, simplifyS
 
 		vscode.postMessage({
 			type: RouterModelsMessageType.requestRouterModels,
-			values: { moonshotApiKey: key, moonshotBaseUrl: apiConfiguration.moonshotBaseUrl },
+			values: {
+				provider: providerIdentifiers.moonshot,
+				moonshotApiKey: key,
+				moonshotBaseUrl: apiConfiguration.moonshotBaseUrl,
+			},
 		})
 	}, [apiConfiguration, t])
 
@@ -123,7 +127,7 @@ export const Moonshot = ({ apiConfiguration, setApiConfigurationField, simplifyS
 			</div>
 			<div>
 				<VSCodeTextField
-					value={apiConfiguration?.moonshotApiKey || ""}
+					value={apiConfiguration.moonshotApiKey || ""}
 					type="password"
 					onInput={handleInputChange("moonshotApiKey")}
 					placeholder={t("settings:placeholders.apiKey")}
@@ -133,7 +137,7 @@ export const Moonshot = ({ apiConfiguration, setApiConfigurationField, simplifyS
 				<div className="text-sm text-vscode-descriptionForeground">
 					{t("settings:providers.apiKeyStorageNotice")}
 				</div>
-				{!apiConfiguration?.moonshotApiKey && (
+				{!apiConfiguration.moonshotApiKey && (
 					<VSCodeButtonLink
 						href={
 							apiConfiguration.moonshotBaseUrl === "https://api.moonshot.cn/v1"

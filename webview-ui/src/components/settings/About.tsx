@@ -4,7 +4,7 @@ import { Trans } from "react-i18next"
 import { ArrowRightLeft, Download, Upload, TriangleAlert, Bug, Lightbulb, Shield, MessagesSquare } from "lucide-react"
 import { VSCodeButton, VSCodeCheckbox, VSCodeLink } from "@vscode/webview-ui-toolkit/react"
 
-import type { ExtensionMessage, TelemetrySetting } from "@roo-code/types"
+import { type ExtensionMessage, type TelemetrySetting, isTelemetryOptedIn } from "@roo-code/types"
 
 import { Package } from "@roo/package"
 
@@ -108,7 +108,7 @@ export const About = ({ telemetrySetting, setTelemetrySetting, debug, setDebug, 
 					section="about"
 					label={t("settings:footer.telemetry.label")}>
 					<VSCodeCheckbox
-						checked={telemetrySetting !== "disabled"}
+						checked={isTelemetryOptedIn(telemetrySetting)}
 						onChange={(e: any) => {
 							const checked = e.target.checked === true
 							setTelemetrySetting(checked ? "enabled" : "disabled")
@@ -117,6 +117,7 @@ export const About = ({ telemetrySetting, setTelemetrySetting, debug, setDebug, 
 					</VSCodeCheckbox>
 					<p className="text-vscode-descriptionForeground text-sm mt-0">
 						<Trans
+							t={t}
 							i18nKey="settings:footer.telemetry.description"
 							components={{
 								privacyLink: <VSCodeLink href="https://www.zoocode.dev/privacy" />,
@@ -160,6 +161,7 @@ export const About = ({ telemetrySetting, setTelemetrySetting, debug, setDebug, 
 						<MessagesSquare className="size-4 text-vscode-descriptionForeground shrink-0" />
 						<span>
 							<Trans
+								t={t}
 								i18nKey="settings:about.community"
 								components={{
 									redditLink: <VSCodeLink href={EXTERNAL_LINKS.REDDIT} />,

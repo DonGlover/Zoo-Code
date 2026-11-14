@@ -46,13 +46,11 @@ Zoo Code phát triển trên nền tảng do Roo Code tạo ra và tiếp tục 
 - **Workflow terminal và chỉnh sửa đáng tin cậy hơn** — sửa lỗi terminal hoàn tất quá sớm, xung đột trạng thái tác vụ, quản lý ngữ cảnh, chỉnh sửa diff và sử dụng công cụ riêng của từng provider.
 - **Kiểm soát workspace tốt hơn** — quản lý quy tắc, giới hạn MCP theo từng chế độ, kiểm soát đường dẫn multi-root, tùy chọn reasoning của model và thao tác xem lại thay đổi khi hoàn tất.
 
-## Điểm mới trong v3.78.0
+## Điểm mới trong v3.96.0
 
-- **Ba model mới quan trọng đã xuất hiện** — sử dụng các model hoàn toàn mới Gemini 3.7 Flash, GLM 5.3 và Qwen3.8 Max, cùng reasoning, giá và phạm vi provider được cập nhật cho DeepSeek V4.
-- **Kết nối với NanoGPT** — sử dụng khám phá model động, streaming và hoàn thành Prompt, cùng tùy chọn định tuyến theo tốc độ, giá, độ trễ, throughput, hỗ trợ tool và caching.
-- **Provider và task đáng tin cậy hơn** — các bản sửa lỗi cải thiện thiết lập endpoint Azure OpenAI, giới hạn đầu ra Kimi Code, giữ nguyên tiêu đề lịch sử task và nhập/xuất cài đặt Zoo.
-- Destructive Command Guard hiện hỗ trợ máy Mac dùng chip Intel.
-- Các bản cập nhật bảo mật khắc phục lỗ hổng trong `undici` và Mermaid.
+- ✨ **Cài đặt trò chuyện và chẩn đoán mới:** Hiển thị dấu thời gian của tin nhắn với định dạng giờ và ngày có thể cấu hình, điều chỉnh TTL prompt-cache cho hồ sơ Anthropic và tạo báo cáo chẩn đoán tôn trọng quyền riêng tư.
+- 💸 **Chi phí và bộ nhớ đệm của nhà cung cấp chính xác hơn:** Giữ nguyên kết quả công cụ của Anthropic, áp dụng token đầu ra tích lũy trong chi phí Anthropic và MiniMax, đọc bộ đếm prompt-cache của DeepSeek, nhắm tới bộ nhớ đệm Responses của xAI và tính phí đọc bộ nhớ đệm Mistral ở mức 0,1x.
+- 🧭 **Trò chuyện đáng tin cậy và nhanh hơn:** Tiếp tục tác vụ đã hoàn thành sau khi khởi động lại, khôi phục checkpoint khi commit đã lưu bị thiếu, tự động tải lại renderer webview đã treo, điều tiết các bản cập nhật trực tuyến và tải ngôn ngữ theo yêu cầu.
 
 ## Zoo Code có thể làm gì cho BẠN?
 

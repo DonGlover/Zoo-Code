@@ -1,11 +1,20 @@
-import type { ModelInfo } from "../model.js"
-import { ZaiApiLine } from "../provider-settings.js"
+import { z } from "zod"
+
+import { type ModelInfo } from "../model.js"
+import { providerIdentifiers } from "../provider-identifiers.js"
+import {
+	API_MODEL_ID_FIELD,
+	apiModelIdProviderModelShape,
+	createModelIdAccessor,
+	createProviderDefinition,
+} from "./common.js"
 
 // Z AI
 // https://docs.z.ai/guides/llm/glm-4-32b-0414-128k
 // https://docs.z.ai/guides/llm/glm-4.5
 // https://docs.z.ai/guides/llm/glm-4.6
 // https://docs.z.ai/guides/llm/glm-5.3
+// https://docs.z.ai/guides/vlm/glm-5.3-flash
 // https://docs.z.ai/guides/llm/glm-5.1
 // https://docs.z.ai/guides/llm/glm-5-turbo
 // https://docs.z.ai/guides/overview/pricing
@@ -24,6 +33,13 @@ const glm53ModelInfo = {
 	defaultTemperature: 1,
 	description:
 		"GLM-5.3 is Zhipu's flagship coding and agent model with a 1M context window, 128k max output, and always-on reasoning with configurable effort (Low/High/Max).",
+} as const satisfies ModelInfo
+
+const glm53FlashModelInfo = {
+	...glm53ModelInfo,
+	supportsImages: true,
+	description:
+		"GLM-5.3-Flash is Zhipu's efficient multimodal coding and agent model with a 1M context window, 128k max output, and always-on reasoning with configurable effort (Low/High/Max).",
 } as const satisfies ModelInfo
 
 export type InternationalZAiModelId = keyof typeof internationalZAiModels
@@ -192,6 +208,13 @@ export const internationalZAiModels = {
 		outputPrice: 4.4,
 		cacheWritesPrice: 0,
 		cacheReadsPrice: 0.26,
+	},
+	"glm-5.3-flash": {
+		...glm53FlashModelInfo,
+		inputPrice: 0.15,
+		outputPrice: 0.5,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0.03,
 	},
 	"glm-5-turbo": {
 		maxTokens: 131_072,
@@ -505,6 +528,13 @@ export const mainlandZAiCodingPlanOnlyModels = {
 		cacheWritesPrice: 0,
 		cacheReadsPrice: 0.13,
 	},
+	"glm-5.3-flash": {
+		...glm53FlashModelInfo,
+		inputPrice: 0.075,
+		outputPrice: 0.25,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0.015,
+	},
 } as const satisfies Record<string, ModelInfo>
 
 export const ZAI_DEFAULT_TEMPERATURE = 0.6
@@ -539,3 +569,41 @@ export function getZAiModels(apiLine: ZaiApiLine = "international_coding"): Reco
 		? { ...regionalModels, ...mainlandZAiCodingPlanOnlyModels }
 		: regionalModels
 }
+
+export const zaiApiLineSchema = z.enum(["international_coding", "china_coding", "international_api", "china_api"])
+export type ZaiApiLine = z.infer<typeof zaiApiLineSchema>
+
+export type ZaiDefaultModelIds = {
+	readonly china: string
+	readonly international: string
+}
+
+const zaiDefaultModelIds: ZaiDefaultModelIds = {
+	china: mainlandZAiDefaultModelId,
+	international: internationalZAiDefaultModelId,
+}
+
+/**
+ * Resolve the default model for a Z.ai API line. Both regional catalogs currently
+ * share a default model ID, so the regional defaults are injectable to let tests
+ * prove the mainland/international mapping is not inverted.
+ */
+export function getZAiDefaultModelId(zaiApiLine: unknown, defaults: ZaiDefaultModelIds = zaiDefaultModelIds): string {
+	const parsedApiLine = zaiApiLineSchema.safeParse(zaiApiLine)
+	const apiLine = parsedApiLine.success ? parsedApiLine.data : "international_coding"
+	return zaiApiLineConfigs[apiLine].isChina ? defaults.china : defaults.international
+}
+
+export const zaiProviderDefinition = createProviderDefinition({
+	apiProvider: providerIdentifiers.zai,
+	modelIdKey: API_MODEL_ID_FIELD,
+	getModelId: createModelIdAccessor(API_MODEL_ID_FIELD),
+	// Z.ai serves separate model catalogs for mainland China and international
+	// endpoints, so the default depends on the configured API line.
+	getDefaultModelId: (settings) => getZAiDefaultModelId(settings.zaiApiLine),
+	schema: {
+		...apiModelIdProviderModelShape,
+		zaiApiKey: z.string().optional(),
+		zaiApiLine: zaiApiLineSchema.optional(),
+	},
+})

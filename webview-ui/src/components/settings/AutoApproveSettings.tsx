@@ -1,4 +1,4 @@
-import { HTMLAttributes, useState } from "react"
+import { FormEvent, HTMLAttributes, useState } from "react"
 import { X } from "lucide-react"
 import { Trans } from "react-i18next"
 import { Package } from "@roo/package"
@@ -12,6 +12,7 @@ import { SetCachedStateField } from "./types"
 import { SectionHeader } from "./SectionHeader"
 import { Section } from "./Section"
 import { SearchableSetting } from "./SearchableSetting"
+import { FilePatternAllowlist } from "./FilePatternAllowlist"
 import { AutoApproveToggle } from "./AutoApproveToggle"
 import { MaxLimitInputs } from "./MaxLimitInputs"
 import { useExtensionState } from "@/context/ExtensionStateContext"
@@ -21,14 +22,17 @@ import { useAutoApprovalToggles } from "@/hooks/useAutoApprovalToggles"
 type AutoApproveSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	alwaysAllowReadOnly?: boolean
 	alwaysAllowReadOnlyOutsideWorkspace?: boolean
+	allowedReadFiles?: string[]
 	alwaysAllowWrite?: boolean
 	alwaysAllowWriteOutsideWorkspace?: boolean
 	alwaysAllowWriteProtected?: boolean
+	allowedWriteFiles?: string[]
 	alwaysAllowMcp?: boolean
 	alwaysAllowModeSwitch?: boolean
 	alwaysAllowSubtasks?: boolean
 	alwaysAllowExecute?: boolean
 	destructiveCommandGuardEnabled?: boolean
+	alwaysDenyUnapprovedCommands?: boolean
 	alwaysAllowFollowupQuestions?: boolean
 	followupAutoApproveTimeoutMs?: number
 	allowedCommands?: string[]
@@ -38,14 +42,17 @@ type AutoApproveSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	setCachedStateField: SetCachedStateField<
 		| "alwaysAllowReadOnly"
 		| "alwaysAllowReadOnlyOutsideWorkspace"
+		| "allowedReadFiles"
 		| "alwaysAllowWrite"
 		| "alwaysAllowWriteOutsideWorkspace"
 		| "alwaysAllowWriteProtected"
+		| "allowedWriteFiles"
 		| "alwaysAllowMcp"
 		| "alwaysAllowModeSwitch"
 		| "alwaysAllowSubtasks"
 		| "alwaysAllowExecute"
 		| "destructiveCommandGuardEnabled"
+		| "alwaysDenyUnapprovedCommands"
 		| "alwaysAllowFollowupQuestions"
 		| "followupAutoApproveTimeoutMs"
 		| "allowedCommands"
@@ -55,17 +62,27 @@ type AutoApproveSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	>
 }
 
+// The toolkit checkbox delivers change events retargeted to its custom-element host, which mirrors
+// `checked` without being an HTMLInputElement; a directly rendered input is one. Match on the
+// property so both target shapes update the setting, and decline targets that carry no boolean
+// `checked` rather than writing `undefined` through the guard.
+const isCheckboxTarget = (target: EventTarget | null): target is EventTarget & { checked: boolean } =>
+	target !== null && "checked" in target && typeof target.checked === "boolean"
+
 export const AutoApproveSettings = ({
 	alwaysAllowReadOnly,
 	alwaysAllowReadOnlyOutsideWorkspace,
+	allowedReadFiles,
 	alwaysAllowWrite,
 	alwaysAllowWriteOutsideWorkspace,
 	alwaysAllowWriteProtected,
+	allowedWriteFiles,
 	alwaysAllowMcp,
 	alwaysAllowModeSwitch,
 	alwaysAllowSubtasks,
 	alwaysAllowExecute,
 	destructiveCommandGuardEnabled,
+	alwaysDenyUnapprovedCommands,
 	alwaysAllowFollowupQuestions,
 	followupAutoApproveTimeoutMs = 60000,
 	allowedCommands,
@@ -128,6 +145,7 @@ export const AutoApproveSettings = ({
 							<p>{t("settings:autoApprove.description")}</p>
 							<p>
 								<Trans
+									t={t}
 									i18nKey="settings:autoApprove.toggleShortcut"
 									components={{
 										SettingsLink: (
@@ -242,6 +260,41 @@ export const AutoApproveSettings = ({
 					</div>
 				)}
 
+				{/*
+				 * Shown regardless of the category toggles above: listing a file
+				 * here is what grants access to it, so it must be reachable
+				 * without first granting that access to everything.
+				 */}
+				<div className="flex flex-col gap-3 pl-3 border-l-2 border-vscode-button-background">
+					<div className="flex items-center gap-4 font-bold">
+						<span className="codicon codicon-file" />
+						<div>{t("settings:autoApprove.allowlists.label")}</div>
+					</div>
+
+					{/* The pattern syntax is shared by every allowlist below. */}
+					<div className="text-vscode-descriptionForeground text-sm">
+						{t("settings:autoApprove.allowlists.description")}
+					</div>
+
+					<FilePatternAllowlist
+						field="allowedReadFiles"
+						settingId="auto-approve-allowed-read-files"
+						testIdPrefix="allowed-read-file"
+						translationKey="readFiles"
+						patterns={allowedReadFiles}
+						setCachedStateField={setCachedStateField}
+					/>
+
+					<FilePatternAllowlist
+						field="allowedWriteFiles"
+						settingId="auto-approve-allowed-write-files"
+						testIdPrefix="allowed-write-file"
+						translationKey="writeFiles"
+						patterns={allowedWriteFiles}
+						setCachedStateField={setCachedStateField}
+					/>
+				</div>
+
 				{alwaysAllowFollowupQuestions && (
 					<div className="flex flex-col gap-3 pl-3 border-l-2 border-vscode-button-background">
 						<div className="flex items-center gap-4 font-bold">
@@ -295,6 +348,28 @@ export const AutoApproveSettings = ({
 							</VSCodeCheckbox>
 							<div className="text-vscode-descriptionForeground text-sm mt-1">
 								{t("settings:autoApprove.execute.destructiveCommandGuard.description")}
+							</div>
+						</SearchableSetting>
+
+						{/* Visible in both DCG modes: it replaces the hidden command
+							   lists as the fail-closed policy in hands-free setups. */}
+						<SearchableSetting
+							settingId="auto-approve-auto-deny-unapproved"
+							section="autoApprove"
+							label={t("settings:autoApprove.execute.autoDeny.label")}>
+							<VSCodeCheckbox
+								checked={alwaysDenyUnapprovedCommands}
+								onChange={(e: Event | FormEvent<HTMLElement>) => {
+									if (!isCheckboxTarget(e.target)) {
+										return
+									}
+									setCachedStateField("alwaysDenyUnapprovedCommands", e.target.checked)
+								}}
+								data-testid="auto-deny-unapproved-checkbox">
+								<span className="font-medium">{t("settings:autoApprove.execute.autoDeny.label")}</span>
+							</VSCodeCheckbox>
+							<div className="text-vscode-descriptionForeground text-sm mt-1">
+								{t("settings:autoApprove.execute.autoDeny.description")}
 							</div>
 						</SearchableSetting>
 

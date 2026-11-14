@@ -12,7 +12,7 @@ import type { CloudUserInfo, CloudOrganizationMembership, OrganizationAllowList,
 import type { SerializedCustomToolDefinition } from "./custom-tool.js"
 import type { GitCommit } from "./git.js"
 import type { McpServer } from "./mcp.js"
-import { RouterModelsMessageType, type ModelRecord, type RouterModels } from "./model.js"
+import { RouterModelsMessageType, type ModelInfo, type ModelRecord, type RouterModels } from "./model.js"
 import { LmStudioModelsMessageType } from "./providers/lm-studio.js"
 import { OllamaModelsMessageType } from "./providers/ollama.js"
 import { OpenAiModelsMessageType } from "./providers/openai.js"
@@ -48,6 +48,9 @@ export interface ExtensionMessage {
 		| typeof OllamaModelsMessageType.ollamaModels
 		| typeof LmStudioModelsMessageType.lmStudioModels
 		| typeof VsCodeLmModelsMessageType.vsCodeLmModels
+		| typeof VsCodeLmModelsMessageType.githubCopilotModels
+		| typeof VsCodeLmModelsMessageType.githubCopilotSignInResult
+		| "settingsSaveResult"
 		| "vsCodeLmApiAvailable"
 		| "updatePrompt"
 		| "systemPrompt"
@@ -106,10 +109,15 @@ export interface ExtensionMessage {
 		| "skills"
 		| "rules"
 		| "fileContent"
+		| "originalContent"
 		| "rooHistoryImportProgress"
+		| "themeFixtureProbeRequest"
+		| "diagnosticsRequest"
 	text?: string
 	/** For fileContent: { path, content, error? } */
 	fileContent?: { path: string; content: string | null; error?: string }
+	/** For originalContent: the pre-edit file content of the requested tool message (null when unavailable) */
+	originalContentInfo?: { ts: number; messageId?: string; taskId?: string; content: string | null }
 	payload?: any // eslint-disable-line @typescript-eslint/no-explicit-any
 	checkpointWarning?: {
 		type: "WAIT_TIMEOUT" | "INIT_TIMEOUT"
@@ -142,7 +150,16 @@ export interface ExtensionMessage {
 	openAiModels?: string[]
 	ollamaModels?: ModelRecord
 	lmStudioModels?: ModelRecord
-	vsCodeLmModels?: { vendor?: string; family?: string; version?: string; id?: string }[]
+	vsCodeLmModels?: {
+		vendor?: string
+		family?: string
+		version?: string
+		id?: string
+		name?: string
+		maxInputTokens?: number
+		modelInfo?: ModelInfo
+	}[]
+	githubCopilotAccount?: string | null
 	mcpServers?: McpServer[]
 	commits?: GitCommit[]
 	listApiConfig?: ProviderSettingsEntry[]
@@ -154,6 +171,8 @@ export interface ExtensionMessage {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	values?: Record<string, any>
 	requestId?: string
+	themeFixture?: WebviewThemeFixture
+	diagnostics?: WebviewDiagnosticsSnapshot
 	promptText?: string
 	results?:
 		| { path: string; type: "file" | "folder"; label?: string }[]
@@ -270,15 +289,18 @@ export type ExtensionState = Pick<
 	| "autoApprovalEnabled"
 	| "alwaysAllowReadOnly"
 	| "alwaysAllowReadOnlyOutsideWorkspace"
+	| "allowedReadFiles"
 	| "alwaysAllowWrite"
 	| "alwaysAllowWriteOutsideWorkspace"
 	| "alwaysAllowWriteProtected"
+	| "allowedWriteFiles"
 	| "alwaysAllowMcp"
 	| "alwaysAllowModeSwitch"
 	| "alwaysAllowSubtasks"
 	| "alwaysAllowFollowupQuestions"
 	| "alwaysAllowExecute"
 	| "destructiveCommandGuardEnabled"
+	| "alwaysDenyUnapprovedCommands"
 	| "followupAutoApproveTimeoutMs"
 	| "allowedCommands"
 	| "deniedCommands"
@@ -291,6 +313,7 @@ export type ExtensionState = Pick<
 	| "terminalOutputPreviewSize"
 	| "terminalShellIntegrationTimeout"
 	| "terminalShellIntegrationDisabled"
+	| "collapseCommandOutputByDefault"
 	| "terminalCommandDelay"
 	| "terminalPowershellCounter"
 	| "terminalZshClearEolMark"
@@ -317,8 +340,13 @@ export type ExtensionState = Pick<
 	| "imageGenerationProvider"
 	| "openRouterImageGenerationSelectedModel"
 	| "includeTaskHistoryInEnhance"
+	| "taskTitleGenerationEnabled"
+	| "taskTitleApiConfigId"
 	| "reasoningBlockCollapsed"
 	| "chatFontSize"
+	| "timeFormat"
+	| "dateFormat"
+	| "showRelativeTimes"
 	| "enterBehavior"
 	| "includeCurrentTime"
 	| "includeCurrentCost"
@@ -364,6 +392,11 @@ export type ExtensionState = Pick<
 	telemetrySetting: TelemetrySetting
 	telemetryKey?: string
 	machineId?: string
+	// Live vscode.env.isTelemetryEnabled, so the webview's own PostHog client can respect
+	// the VS Code global telemetry toggle the same way the extension-side gate does --
+	// without this, an explicit user Accept can still send events while VS Code's global
+	// telemetry is disabled.
+	vscodeTelemetryEnabled?: boolean
 
 	renderContext: "sidebar" | "editor"
 	settingsImportedAt?: number
@@ -442,6 +475,40 @@ export type ClineAskResponse = "yesButtonClicked" | "noButtonClicked" | "message
 
 export type AudioType = "notification" | "celebration" | "progress_loop"
 
+export interface WebviewDiagnosticsSnapshot {
+	capturedAt: string
+	didHydrateState?: boolean
+	documentReadyState?: "loading" | "interactive" | "complete"
+	documentVisibilityState?: "hidden" | "visible" | "prerender"
+	activeView?: string
+	rootMounted?: boolean
+	rootChildCount?: number
+	lastReceivedStateSequence?: number
+	lastAppliedStateSequence?: number
+	staleStateRejectionCount?: number
+	unknownMessageUpdateCount?: number
+	currentTaskId?: string
+	chatMessageCount?: number
+	historyItemCount?: number
+	todoCount?: number
+	viewport?: { width: number; height: number; devicePixelRatio: number }
+	theme?: {
+		kind?: number
+		identifier?: string
+		bodyForeground?: string
+		bodyBackground?: string
+		rootForeground?: string
+		rootBackground?: string
+		variables?: Record<string, string>
+	}
+	error?: {
+		name?: string
+		message?: string
+		fingerprint?: string
+		stackLocations?: string[]
+	}
+}
+
 export interface UpdateTodoListPayload {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	todos: any[]
@@ -456,6 +523,7 @@ export interface WebviewMessage {
 		| "currentApiConfigName"
 		| "saveApiConfiguration"
 		| "upsertApiConfiguration"
+		| "updateProfileModel"
 		| "deleteApiConfiguration"
 		| "loadApiConfiguration"
 		| "loadApiConfigurationById"
@@ -463,6 +531,8 @@ export interface WebviewMessage {
 		| "getListApiConfiguration"
 		| "customInstructions"
 		| "webviewDidLaunch"
+		| "webviewHeartbeat"
+		| "webviewDidFocus"
 		| "newTask"
 		| "askResponse"
 		| "terminalOperation"
@@ -475,6 +545,7 @@ export interface WebviewMessage {
 		| "deleteTaskWithId"
 		| "abandonSubtaskWithId"
 		| "exportTaskWithId"
+		| "renameTaskWithId"
 		| "importSettings"
 		| "exportSettings"
 		| "resetState"
@@ -485,10 +556,14 @@ export interface WebviewMessage {
 		| typeof LmStudioModelsMessageType.requestLmStudioModels
 		| "requestRooModels"
 		| typeof VsCodeLmModelsMessageType.requestVsCodeLmModels
+		| typeof VsCodeLmModelsMessageType.githubCopilotSignIn
+		| typeof VsCodeLmModelsMessageType.githubCopilotReconnect
+		| typeof VsCodeLmModelsMessageType.githubCopilotManageAccount
 		| "openImage"
 		| "saveImage"
 		| "openFile"
 		| "readFileContent"
+		| "readOriginalContent"
 		| "openMention"
 		| "cancelTask"
 		| "cancelAutoApproval"
@@ -636,6 +711,8 @@ export interface WebviewMessage {
 		| "deleteRule"
 		| "openRuleFile"
 		| "openRulesDirectory"
+		| "themeFixtureProbeResponse"
+		| "diagnosticsResponse"
 	text?: string
 	taskId?: string
 	editedMessageContent?: string
@@ -682,9 +759,13 @@ export interface WebviewMessage {
 	/** Target mode slugs for updateSkillModes */
 	newSkillModeSlugs?: string[] // For updateSkillModes (new mode restrictions)
 	requestId?: string
+	themeFixture?: WebviewThemeFixture
+	diagnostics?: WebviewDiagnosticsSnapshot
 	ids?: string[]
 	terminalOperation?: "continue" | "abort"
 	messageTs?: number
+	timestamp?: number // For webviewHeartbeat
+	messageId?: string
 	restoreCheckpoint?: boolean
 	historyPreviewCollapsed?: boolean
 	filters?: { type?: string; search?: string; tags?: string[] }
@@ -746,6 +827,12 @@ export interface WebviewMessage {
 	worktreeForce?: boolean
 	worktreeNewWindow?: boolean
 	worktreeIncludeContent?: string
+}
+
+export interface WebviewThemeFixture {
+	themeId: string
+	bodyClass: string
+	variables: Record<string, string>
 }
 
 export interface RequestOpenAiCodexRateLimitsMessage {
@@ -841,6 +928,8 @@ export interface ClineSayTool {
 	content?: string
 	// Original file content before first edit (for merged diff display in FileChangesPanel)
 	originalContent?: string
+	// Length of the originalContent the extension left out of the webview state (request it with readOriginalContent)
+	originalContentLength?: number
 	// Unified diff statistics computed by the extension
 	diffStats?: { added: number; removed: number }
 	regex?: string

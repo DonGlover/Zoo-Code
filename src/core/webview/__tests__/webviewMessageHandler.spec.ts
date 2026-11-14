@@ -4,11 +4,23 @@ import type { Mock } from "vitest"
 
 // Mock dependencies - must come before imports
 vi.mock("../../../api/providers/fetchers/modelCache")
+// The refactor routes model-list fetches through an ApiHandler built by buildApiHandler.
+// Mock it so the handler is a lightweight double instead of a real provider (which would
+// require credentials and other un-mocked collaborators).
+vi.mock("../../../api", () => ({
+	buildApiHandler: vi.fn().mockReturnValue({
+		getModel: vi.fn().mockReturnValue({ id: "claude-3-sonnet" }),
+	}),
+}))
 vi.mock("../../../services/zoo-code-auth", () => ({
 	disconnectZooCode: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock("../../../api/providers/fetchers/lmstudio", () => ({
 	getLMStudioModels: vi.fn(),
+}))
+
+vi.mock("../../../integrations/theme/getTheme", () => ({
+	getTheme: vi.fn().mockResolvedValue({}),
 }))
 
 vi.mock("../../../integrations/openai-codex/oauth", () => ({
@@ -55,10 +67,24 @@ vi.mock("../rulesMessageHandler", () => ({
 	handleOpenRulesDirectory: vi.fn(),
 }))
 
+vi.mock("@roo-code/telemetry", () => ({
+	TelemetryService: {
+		hasInstance: vi.fn().mockReturnValue(false),
+		instance: {
+			updateTelemetryState: vi.fn(),
+			captureTelemetrySettingsChanged: vi.fn(),
+		},
+	},
+}))
+
 import type { ModelRecord } from "@roo-code/types"
+import * as vsCodeLmProvider from "../../../api/providers/vscode-lm"
+import * as copilotProvider from "../../../api/providers/github-copilot"
 
 import { webviewMessageHandler } from "../webviewMessageHandler"
+import { registerCopilotModelBroadcast } from "../../../services/language-models/copilotModelBroadcast"
 import type { ClineProvider } from "../ClineProvider"
+import { experimentDefault } from "../../../shared/experiments"
 import { flushModels, getModels } from "../../../api/providers/fetchers/modelCache"
 import { getLMStudioModels } from "../../../api/providers/fetchers/lmstudio"
 import { getCommands } from "../../../services/command/commands"
@@ -103,14 +129,651 @@ const mockClineProvider = {
 	},
 	log: vi.fn(),
 	postStateToWebview: vi.fn(),
+	resolveWebviewThemeFixtureProbe: vi.fn(),
 	getCurrentTask: vi.fn(),
 	getTaskWithId: vi.fn(),
 	createTaskWithHistoryItem: vi.fn(),
+	renameTaskWithId: vi.fn(),
 	getSkillsManager: vi.fn(),
 	cwd: "/mock/workspace",
 } as unknown as ClineProvider
 
-import { t } from "../../../i18n"
+describe("webviewMessageHandler - Copilot authentication", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+		mockClineProvider.getState = vi.fn().mockResolvedValue({ apiConfiguration: {} })
+	})
+	afterEach(() => vi.restoreAllMocks())
+
+	it("reports the account before models finish loading without exposing a token", async () => {
+		vi.spyOn(copilotProvider, "connectGitHubCopilot").mockImplementation(
+			async (onAuthenticated?: (account: string) => Promise<void>) => {
+				await onAuthenticated?.("Test User")
+				return { account: "Test User", models: [] }
+			},
+		)
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(1, {
+			type: "githubCopilotModels",
+			githubCopilotAccount: "Test User",
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(2, {
+			type: "githubCopilotSignInResult",
+			githubCopilotAccount: "Test User",
+			vsCodeLmModels: [],
+		})
+		expect(JSON.stringify(vi.mocked(mockClineProvider.postMessageToWebview).mock.calls)).not.toContain(
+			"accessToken",
+		)
+		expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalled()
+	})
+
+	it("returns sign-in errors to the requesting control", async () => {
+		vi.spyOn(copilotProvider, "connectGitHubCopilot").mockRejectedValue(new Error("Sign-in cancelled"))
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotSignInResult",
+			error: "Sign-in cancelled",
+		})
+	})
+
+	it("uses a fresh session for the reconnect command", async () => {
+		const connect = vi
+			.spyOn(copilotProvider, "connectGitHubCopilot")
+			.mockResolvedValue({ account: "New User", models: [] })
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotReconnect" })
+		expect(connect).toHaveBeenCalledWith(expect.any(Function), true)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotSignInResult",
+			githubCopilotAccount: "New User",
+			vsCodeLmModels: [],
+		})
+	})
+
+	it("drops a stale sign-in that completes after a newer reconnect", async () => {
+		let finishSignIn!: (value: { account: string; models: [] }) => void
+		let finishReconnect!: (value: { account: string; models: [] }) => void
+		vi.spyOn(copilotProvider, "connectGitHubCopilot")
+			.mockImplementationOnce(() => new Promise((resolve) => (finishSignIn = resolve)))
+			.mockImplementationOnce(() => new Promise((resolve) => (finishReconnect = resolve)))
+
+		const signIn = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		const reconnect = webviewMessageHandler(mockClineProvider, { type: "githubCopilotReconnect" })
+
+		// The newer request finishes first, then the older one arrives late.
+		finishReconnect({ account: "New User", models: [] })
+		await reconnect
+		finishSignIn({ account: "Old User", models: [] })
+		await signIn
+
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotSignInResult",
+			githubCopilotAccount: "New User",
+			vsCodeLmModels: [],
+		})
+	})
+
+	it("drops a stale sign-in failure that arrives after a newer success", async () => {
+		let failSignIn!: (reason: Error) => void
+		let finishReconnect!: (value: { account: string; models: [] }) => void
+		vi.spyOn(copilotProvider, "connectGitHubCopilot")
+			.mockImplementationOnce(() => new Promise((_resolve, reject) => (failSignIn = reject)))
+			.mockImplementationOnce(() => new Promise((resolve) => (finishReconnect = resolve)))
+
+		const signIn = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		const reconnect = webviewMessageHandler(mockClineProvider, { type: "githubCopilotReconnect" })
+
+		finishReconnect({ account: "New User", models: [] })
+		await reconnect
+		failSignIn(new Error("Sign-in cancelled"))
+		await signIn
+
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).not.toHaveBeenCalledWith(
+			expect.objectContaining({ error: expect.anything() }),
+		)
+	})
+
+	it("answers every view that signs in, since only a view's own newer request makes its older one stale", async () => {
+		const otherView = {
+			...mockClineProvider,
+			postMessageToWebview: vi.fn(),
+		} as unknown as ClineProvider
+		let finishFirst!: (value: { account: string; models: [] }) => void
+		let finishSecond!: (value: { account: string; models: [] }) => void
+		vi.spyOn(copilotProvider, "connectGitHubCopilot")
+			.mockImplementationOnce(() => new Promise((resolve) => (finishFirst = resolve)))
+			.mockImplementationOnce(() => new Promise((resolve) => (finishSecond = resolve)))
+
+		const first = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		const second = webviewMessageHandler(otherView, { type: "githubCopilotSignIn" })
+		finishSecond({ account: "Second User", models: [] })
+		finishFirst({ account: "First User", models: [] })
+		await Promise.all([first, second])
+
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "githubCopilotSignInResult", githubCopilotAccount: "First User" }),
+		)
+		expect(otherView.postMessageToWebview).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "githubCopilotSignInResult", githubCopilotAccount: "Second User" }),
+		)
+	})
+
+	it("opens VS Code's account management and never signs out itself", async () => {
+		const open = vi.spyOn(copilotProvider, "openGitHubAccountManagement").mockResolvedValue(undefined)
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotManageAccount" })
+		expect(open).toHaveBeenCalledOnce()
+		expect(mockClineProvider.postMessageToWebview).not.toHaveBeenCalled()
+	})
+
+	it("logs, rather than surfacing, a failure to open account management", async () => {
+		vi.spyOn(copilotProvider, "openGitHubAccountManagement").mockRejectedValue(new Error("command missing"))
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotManageAccount" })
+		expect(mockClineProvider.log).toHaveBeenCalledWith(expect.stringContaining("command missing"))
+	})
+
+	it("reports a non-Error sign-in failure as text", async () => {
+		vi.spyOn(copilotProvider, "connectGitHubCopilot").mockRejectedValue("denied")
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotSignInResult",
+			error: "denied",
+		})
+	})
+
+	it("logs a non-Error failure to open account management", async () => {
+		vi.spyOn(copilotProvider, "openGitHubAccountManagement").mockRejectedValue("no such command")
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotManageAccount" })
+		expect(mockClineProvider.log).toHaveBeenCalledWith(expect.stringContaining("no such command"))
+	})
+
+	describe("legacy VS Code LM model requests", () => {
+		it("lists the host's models as before and never looks up a GitHub account", async () => {
+			const account = vi.spyOn(copilotProvider, "getGitHubCopilotAccount")
+			const copilotModels = vi.spyOn(copilotProvider, "getGitHubCopilotModels")
+			const models = vi.spyOn(vsCodeLmProvider, "getVsCodeLmModels").mockResolvedValue([])
+
+			await webviewMessageHandler(mockClineProvider, { type: "requestVsCodeLmModels" })
+
+			expect(models).toHaveBeenCalledWith()
+			expect(account).not.toHaveBeenCalled()
+			expect(copilotModels).not.toHaveBeenCalled()
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledExactlyOnceWith({
+				type: "vsCodeLmModels",
+				vsCodeLmModels: [],
+			})
+		})
+	})
+
+	it("restores a signed-in account during passive model refresh", async () => {
+		vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+		vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestVsCodeLmModels",
+			apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+		})
+		expect(copilotProvider.getGitHubCopilotModels).toHaveBeenCalled()
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotModels",
+			githubCopilotAccount: "Test User",
+			vsCodeLmModels: [],
+		})
+	})
+
+	it("drops the early account update of a sign-in that a newer one has superseded", async () => {
+		let supersededCallback!: (account: string) => Promise<void>
+		let finishSupersededSignIn!: (value: { account: string; models: [] }) => void
+		vi.spyOn(copilotProvider, "connectGitHubCopilot")
+			.mockImplementationOnce((onAuthenticated) => {
+				supersededCallback = onAuthenticated!
+				return new Promise((resolve) => (finishSupersededSignIn = resolve))
+			})
+			.mockResolvedValueOnce({ account: "New User", models: [] })
+
+		const superseded = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		await webviewMessageHandler(mockClineProvider, { type: "githubCopilotReconnect" })
+		await supersededCallback("Old User")
+		finishSupersededSignIn({ account: "Old User", models: [] })
+		await superseded
+
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledExactlyOnceWith({
+			type: "githubCopilotSignInResult",
+			githubCopilotAccount: "New User",
+			vsCodeLmModels: [],
+		})
+	})
+
+	it("publishes the early account update of a sign-in that is still the newest", async () => {
+		let callback!: (account: string) => Promise<void>
+		let finish!: (value: { account: string; models: [] }) => void
+		vi.spyOn(copilotProvider, "connectGitHubCopilot").mockImplementation((onAuthenticated) => {
+			callback = onAuthenticated!
+			return new Promise((resolve) => (finish = resolve))
+		})
+
+		const signIn = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+		await callback("Test User")
+
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotModels",
+			githubCopilotAccount: "Test User",
+		})
+		finish({ account: "Test User", models: [] })
+		await signIn
+	})
+
+	it("reports no account as null, so the webview clears a stale sign-in rather than keeping it", async () => {
+		vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue(undefined)
+		vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestVsCodeLmModels",
+			apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotModels",
+			githubCopilotAccount: null,
+			vsCodeLmModels: [],
+		})
+	})
+
+	describe("passive refresh racing a sign-in", () => {
+		const passiveRequest = () =>
+			webviewMessageHandler(mockClineProvider, {
+				type: "requestVsCodeLmModels",
+				apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+			})
+		const signedInResult = {
+			type: "githubCopilotSignInResult",
+			githubCopilotAccount: "New User",
+			vsCodeLmModels: [],
+		}
+
+		it("discards a refresh that began before a sign-in which finished first", async () => {
+			let finishModels!: (models: []) => void
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue(undefined)
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() => new Promise((resolve) => (finishModels = resolve)),
+			)
+			vi.spyOn(copilotProvider, "connectGitHubCopilot").mockResolvedValue({ account: "New User", models: [] })
+
+			const refresh = passiveRequest()
+			await webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+			finishModels([])
+			await refresh
+
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledTimes(1)
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith(signedInResult)
+		})
+
+		it("discards a refresh whose model lookup fails after a newer sign-in", async () => {
+			let failModels!: (reason: Error) => void
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue(undefined)
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() => new Promise((_resolve, reject) => (failModels = reject)),
+			)
+			vi.spyOn(copilotProvider, "connectGitHubCopilot").mockResolvedValue({ account: "New User", models: [] })
+
+			const refresh = passiveRequest()
+			await webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+			failModels(new Error("host busy"))
+			await refresh
+
+			expect(mockClineProvider.postMessageToWebview).not.toHaveBeenCalledWith(
+				expect.objectContaining({ error: expect.anything() }),
+			)
+		})
+
+		it("discards a refresh that began during a sign-in and ended after it", async () => {
+			let finishSignIn!: (value: { account: string; models: [] }) => void
+			let finishModels!: (models: []) => void
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue(undefined)
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() => new Promise((resolve) => (finishModels = resolve)),
+			)
+			vi.spyOn(copilotProvider, "connectGitHubCopilot").mockImplementation(
+				() => new Promise((resolve) => (finishSignIn = resolve)),
+			)
+
+			const signIn = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+			const refresh = passiveRequest()
+			finishSignIn({ account: "New User", models: [] })
+			await signIn
+			finishModels([])
+			await refresh
+
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledTimes(1)
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith(signedInResult)
+		})
+
+		it("does not make a pending sign-in stale by starting a refresh", async () => {
+			let finishSignIn!: (value: { account: string; models: [] }) => void
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue(undefined)
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+			vi.spyOn(copilotProvider, "connectGitHubCopilot").mockImplementation(
+				() => new Promise((resolve) => (finishSignIn = resolve)),
+			)
+
+			const signIn = webviewMessageHandler(mockClineProvider, { type: "githubCopilotSignIn" })
+			await passiveRequest()
+			finishSignIn({ account: "New User", models: [] })
+			await signIn
+
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith(signedInResult)
+		})
+
+		it("still answers a refresh when no sign-in happened meanwhile", async () => {
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+
+			await passiveRequest()
+
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+				type: "githubCopilotModels",
+				githubCopilotAccount: "Test User",
+				vsCodeLmModels: [],
+			})
+		})
+
+		it("discards an older refresh that finishes after a newer one, even with no sign-in", async () => {
+			const finishers: Array<(models: Array<{ id: string }>) => void> = []
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() => new Promise((resolve) => finishers.push(resolve as (models: Array<{ id: string }>) => void)),
+			)
+
+			const older = passiveRequest()
+			const newer = passiveRequest()
+			await vi.waitFor(() => expect(finishers).toHaveLength(2))
+
+			finishers[1]([{ id: "newer" }])
+			await newer
+			finishers[0]([{ id: "older" }])
+			await older
+
+			const posted = vi.mocked(mockClineProvider.postMessageToWebview).mock.calls.map(([message]) => message)
+			expect(posted).toEqual([
+				{ type: "githubCopilotModels", githubCopilotAccount: "Test User", vsCodeLmModels: [{ id: "newer" }] },
+			])
+		})
+
+		it("discards an older refresh's error that arrives after a newer refresh succeeded", async () => {
+			const settlers: Array<{
+				resolve: (models: Array<{ id: string }>) => void
+				reject: (error: Error) => void
+			}> = []
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() =>
+					new Promise((resolve, reject) =>
+						settlers.push({ resolve: resolve as (models: Array<{ id: string }>) => void, reject }),
+					),
+			)
+
+			const older = passiveRequest()
+			const newer = passiveRequest()
+			await vi.waitFor(() => expect(settlers).toHaveLength(2))
+
+			settlers[1].resolve([{ id: "newer" }])
+			await newer
+			settlers[0].reject(new Error("host busy"))
+			await older
+
+			const posted = vi.mocked(mockClineProvider.postMessageToWebview).mock.calls.map(([message]) => message)
+			expect(posted).toEqual([
+				{ type: "githubCopilotModels", githubCopilotAccount: "Test User", vsCodeLmModels: [{ id: "newer" }] },
+			])
+		})
+
+		it("keeps one view's refresh from discarding another view's refresh", async () => {
+			const otherView = { ...mockClineProvider, postMessageToWebview: vi.fn() } as unknown as ClineProvider
+			let finishFirst!: (models: Array<{ id: string }>) => void
+			let calls = 0
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(() =>
+				++calls === 1
+					? new Promise((resolve) => (finishFirst = resolve as (models: Array<{ id: string }>) => void))
+					: Promise.resolve([{ id: "other-view" }] as never),
+			)
+
+			const refresh = passiveRequest()
+			await vi.waitFor(() => expect(calls).toBe(1))
+			await webviewMessageHandler(otherView, {
+				type: "requestVsCodeLmModels",
+				apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+			})
+			finishFirst([{ id: "first-view" }])
+			await refresh
+
+			const posted = vi.mocked(mockClineProvider.postMessageToWebview).mock.calls.map(([message]) => message)
+			expect(posted).toEqual([
+				{
+					type: "githubCopilotModels",
+					githubCopilotAccount: "Test User",
+					vsCodeLmModels: [{ id: "first-view" }],
+				},
+			])
+		})
+
+		it("discards a manual refresh that a host model-change broadcast overtook", async () => {
+			let finishManual!: (models: Array<{ id: string }>) => void
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+				() => new Promise((resolve) => (finishManual = resolve as (models: Array<{ id: string }>) => void)),
+			)
+			let notifyHost!: () => void
+			const broadcast = registerCopilotModelBroadcast({
+				getTargets: () => [mockClineProvider],
+				log: vi.fn(),
+				debounceMs: 0,
+				subscribe: (listener: () => void) => {
+					notifyHost = listener
+					return { dispose: () => {} }
+				},
+				fetchModels: async () => [{ id: "new-from-host" }] as never,
+				fetchAccount: async () => "Test User",
+			})
+			try {
+				// A manual refresh starts first and is still waiting on the host.
+				const manual = passiveRequest()
+				await vi.waitFor(() => expect(finishManual).toBeDefined())
+
+				// The host then reports new models, and the broadcast delivers them.
+				notifyHost()
+				await vi.waitFor(() => expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledTimes(1))
+
+				// The manual refresh finishes last, with the older list.
+				finishManual([{ id: "old-from-manual" }])
+				await manual
+
+				const posted = vi.mocked(mockClineProvider.postMessageToWebview).mock.calls.map(([message]) => message)
+				expect(posted).toEqual([
+					{
+						type: "githubCopilotModels",
+						githubCopilotAccount: "Test User",
+						vsCodeLmModels: [{ id: "new-from-host" }],
+					},
+				])
+			} finally {
+				broadcast.dispose()
+			}
+		})
+
+		describe("a broadcast that does not deliver", () => {
+			const pendingManual = () => {
+				let finishManual!: (models: Array<{ id: string }>) => void
+				vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+				vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockImplementation(
+					() => new Promise((resolve) => (finishManual = resolve as (models: Array<{ id: string }>) => void)),
+				)
+				return { finish: (models: Array<{ id: string }>) => finishManual(models) }
+			}
+			const broadcastWith = (fetchModels: () => Promise<never>) => {
+				let notifyHost!: () => void
+				const registration = registerCopilotModelBroadcast({
+					getTargets: () => [mockClineProvider],
+					log: vi.fn(),
+					debounceMs: 0,
+					subscribe: (listener: () => void) => {
+						notifyHost = listener
+						return { dispose: () => {} }
+					},
+					fetchModels,
+					fetchAccount: async () => "Test User",
+				})
+				return { notify: () => notifyHost(), registration }
+			}
+			const expectManualReplyDelivered = () =>
+				expect(
+					vi.mocked(mockClineProvider.postMessageToWebview).mock.calls.map(([message]) => message),
+				).toEqual([
+					{
+						type: "githubCopilotModels",
+						githubCopilotAccount: "Test User",
+						vsCodeLmModels: [{ id: "manual" }],
+					},
+				])
+
+			it("still delivers a manual refresh when the broadcast's lookup fails", async () => {
+				const manualLookup = pendingManual()
+				const { notify, registration } = broadcastWith(() => Promise.reject(new Error("host busy")))
+				try {
+					const manual = passiveRequest()
+					await vi.waitFor(() => expect(copilotProvider.getGitHubCopilotModels).toHaveBeenCalled())
+					notify()
+					await new Promise((resolve) => setTimeout(resolve, 0))
+
+					manualLookup.finish([{ id: "manual" }])
+					await manual
+
+					// Otherwise the view's refresh spinner never clears and its buttons stay disabled.
+					expectManualReplyDelivered()
+				} finally {
+					registration.dispose()
+				}
+			})
+
+			it("still delivers a manual refresh when a newer broadcast supersedes the first and both fail", async () => {
+				const manualLookup = pendingManual()
+				const { notify, registration } = broadcastWith(() => Promise.reject(new Error("host busy")))
+				try {
+					const manual = passiveRequest()
+					await vi.waitFor(() => expect(copilotProvider.getGitHubCopilotModels).toHaveBeenCalled())
+					notify()
+					notify()
+					await new Promise((resolve) => setTimeout(resolve, 0))
+
+					manualLookup.finish([{ id: "manual" }])
+					await manual
+
+					expectManualReplyDelivered()
+				} finally {
+					registration.dispose()
+				}
+			})
+		})
+
+		it("reports a thrown account lookup as an error, so the webview keeps its account label", async () => {
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockRejectedValue(new Error("auth unavailable"))
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+
+			await passiveRequest()
+
+			// No githubCopilotAccount field: the webview leaves its label alone rather than clearing it.
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledExactlyOnceWith({
+				type: "githubCopilotModels",
+				error: "auth unavailable",
+			})
+		})
+
+		it("keeps one view's sign-in from discarding another view's refresh", async () => {
+			const otherView = { ...mockClineProvider, postMessageToWebview: vi.fn() } as unknown as ClineProvider
+			vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+			vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockResolvedValue([])
+			vi.spyOn(copilotProvider, "connectGitHubCopilot").mockResolvedValue({ account: "Other", models: [] })
+
+			const refresh = passiveRequest()
+			await webviewMessageHandler(otherView, { type: "githubCopilotSignIn" })
+			await refresh
+
+			expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "githubCopilotModels", githubCopilotAccount: "Test User" }),
+			)
+		})
+	})
+
+	it("reports a model discovery failure that is not an Error as text", async () => {
+		vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+		vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockRejectedValue("quota exceeded")
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestVsCodeLmModels",
+			apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotModels",
+			error: "quota exceeded",
+		})
+	})
+
+	it("shows model discovery errors instead of silently returning an empty list", async () => {
+		vi.spyOn(copilotProvider, "getGitHubCopilotAccount").mockResolvedValue("Test User")
+		vi.spyOn(copilotProvider, "getGitHubCopilotModels").mockRejectedValue(new Error("Model access denied"))
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestVsCodeLmModels",
+			apiConfiguration: { apiProvider: providerIdentifiers.githubCopilot },
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "githubCopilotModels",
+			error: "Model access denied",
+		})
+	})
+})
+
+describe("webviewMessageHandler - theme fixture probes", () => {
+	const originalProbeSetting = process.env.ROO_CODE_THEME_FIXTURE_PROBE
+	const themeFixture = {
+		themeId: "Default Dark Modern",
+		bodyClass: "vscode-dark",
+		variables: { "--vscode-foreground": "#cccccc" },
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks()
+		process.env.ROO_CODE_THEME_FIXTURE_PROBE = "1"
+	})
+
+	afterEach(() => {
+		if (originalProbeSetting === undefined) {
+			delete process.env.ROO_CODE_THEME_FIXTURE_PROBE
+		} else {
+			process.env.ROO_CODE_THEME_FIXTURE_PROBE = originalProbeSetting
+		}
+	})
+
+	it("resolves a complete response when probing is enabled", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "themeFixtureProbeResponse",
+			requestId: "request-1",
+			themeFixture,
+		})
+
+		expect(mockClineProvider.resolveWebviewThemeFixtureProbe).toHaveBeenCalledWith("request-1", themeFixture)
+	})
+
+	it("ignores incomplete or disabled responses", async () => {
+		await webviewMessageHandler(mockClineProvider, { type: "themeFixtureProbeResponse" })
+		delete process.env.ROO_CODE_THEME_FIXTURE_PROBE
+		await webviewMessageHandler(mockClineProvider, {
+			type: "themeFixtureProbeResponse",
+			requestId: "request-1",
+			themeFixture,
+		})
+
+		expect(mockClineProvider.resolveWebviewThemeFixtureProbe).not.toHaveBeenCalled()
+	})
+})
+
+import { changeLanguage, t } from "../../../i18n"
 
 vi.mock("vscode", () => {
 	const showInformationMessage = vi.fn()
@@ -132,10 +795,14 @@ vi.mock("vscode", () => {
 		commands: {
 			executeCommand: vi.fn().mockResolvedValue(undefined),
 		},
+		env: {
+			isTelemetryEnabled: true,
+		},
 	}
 })
 
 vi.mock("../../../i18n", () => ({
+	changeLanguage: vi.fn(),
 	t: vi.fn((key: string, args?: Record<string, any>) => {
 		// For the delete confirmation with rules, we need to return the interpolated string
 		if (key === "common:confirmation.delete_custom_mode_with_rules" && args) {
@@ -197,6 +864,7 @@ vi.mock("../../mentions/resolveImageMentions", () => ({
 import { resolveImageMentions } from "../../mentions/resolveImageMentions"
 import { Terminal } from "../../../integrations/terminal/Terminal"
 import { TerminalRegistry } from "../../../integrations/terminal/TerminalRegistry"
+import { providerIdentifiers, retiredProviderIdentifiers } from "@roo-code/types/provider-identifiers"
 
 describe("webviewMessageHandler - requestLmStudioModels", () => {
 	beforeEach(() => {
@@ -232,7 +900,13 @@ describe("webviewMessageHandler - requestLmStudioModels", () => {
 			type: "requestLmStudioModels",
 		})
 
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "lmstudio", baseUrl: "http://localhost:1234" })
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.lmstudio,
+				baseUrl: "http://localhost:1234",
+			},
+			expect.anything(),
+		)
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "lmStudioModels",
@@ -332,7 +1006,13 @@ describe("webviewMessageHandler - requestOllamaModels", () => {
 			type: "requestOllamaModels",
 		})
 
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "ollama", baseUrl: "http://localhost:1234" })
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.ollama,
+				baseUrl: "http://localhost:1234",
+			},
+			expect.anything(),
+		)
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "ollamaModels",
@@ -413,17 +1093,21 @@ describe("webviewMessageHandler - requestOllamaModels", () => {
 		// Should use the URL from message values, not the saved state
 		expect(mockFlushModels).toHaveBeenCalledWith(
 			{
-				provider: "ollama",
+				provider: providerIdentifiers.ollama,
 				baseUrl: "https://ollama.example.com",
 				apiKey: "secret-key",
 			},
+			expect.anything(),
 			true,
 		)
-		expect(mockGetModels).toHaveBeenCalledWith({
-			provider: "ollama",
-			baseUrl: "https://ollama.example.com",
-			apiKey: "secret-key",
-		})
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.ollama,
+				baseUrl: "https://ollama.example.com",
+				apiKey: "secret-key",
+			},
+			expect.anything(),
+		)
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "ollamaModels",
@@ -468,25 +1152,46 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		})
 
 		// Verify getModels was called for each provider
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "openrouter" })
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "requesty", apiKey: "requesty-key" })
+		expect(mockGetModels).toHaveBeenCalledWith({ provider: providerIdentifiers.openrouter }, expect.anything())
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.requesty, apiKey: "requesty-key" },
+			expect.anything(),
+		)
 		expect(mockGetModels).toHaveBeenCalledWith(
 			expect.objectContaining({
-				provider: "unbound",
+				provider: providerIdentifiers.unbound,
 			}),
+			expect.anything(),
 		)
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "vercel-ai-gateway" })
-		expect(mockGetModels).toHaveBeenCalledWith({
-			provider: "litellm",
-			apiKey: "litellm-key",
-			baseUrl: "http://localhost:4000",
-		})
+		expect(mockGetModels).toHaveBeenCalledWith({ provider: providerIdentifiers.vercelAiGateway }, expect.anything())
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.litellm,
+				apiKey: "litellm-key",
+				baseUrl: "http://localhost:4000",
+			},
+			expect.anything(),
+		)
 		// Opencode Go's /models endpoint is public, so it is fetched like the other no-auth routers.
-		expect(mockGetModels).toHaveBeenCalledWith(expect.objectContaining({ provider: "opencode-go" }))
+		expect(mockGetModels).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: providerIdentifiers.opencodeGo }),
+			expect.anything(),
+		)
 		// Kenari's /models endpoint is public, so it is fetched like the other no-auth routers.
-		expect(mockGetModels).toHaveBeenCalledWith(expect.objectContaining({ provider: "kenari" }))
+		expect(mockGetModels).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: providerIdentifiers.kenari }),
+			expect.anything(),
+		)
+		// IO Intelligence's /models catalog is public and may optionally be scoped by a key.
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.ioIntelligence, apiKey: undefined },
+			expect.anything(),
+		)
 		// NanoGPT's detailed catalog is public and may optionally be scoped by a key.
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: undefined })
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: undefined },
+			expect.anything(),
+		)
 
 		// Verify response was sent
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
@@ -505,8 +1210,10 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 				moonshot: {},
 				"opencode-go": mockModels,
 				kenari: mockModels,
+				"io-intelligence": mockModels,
 				nanogpt: mockModels,
 				"kimi-code": {},
+				friendli: mockModels,
 			},
 			values: undefined,
 		})
@@ -533,7 +1240,10 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		await webviewMessageHandler(mockClineProvider, { type: "requestRouterModels" })
 
 		// Must be fetched despite no configured key, forwarding apiKey: undefined.
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "opencode-go", apiKey: undefined })
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.opencodeGo, apiKey: undefined },
+			expect.anything(),
+		)
 
 		const routerModelsCall = (mockClineProvider.postMessageToWebview as any).mock.calls.find(
 			([msg]: [{ type: string }]) => msg.type === "routerModels",
@@ -557,13 +1267,20 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestRouterModels",
 			values: {
-				provider: "opencode-go",
+				provider: providerIdentifiers.opencodeGo,
 				opencodeGoApiKey: "fresh-key",
 			},
 		})
 
-		expect(mockFlushModels).toHaveBeenCalledWith({ provider: "opencode-go", apiKey: "fresh-key" }, true)
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "opencode-go", apiKey: "fresh-key" })
+		expect(mockFlushModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.opencodeGo, apiKey: "fresh-key" },
+			expect.anything(),
+			true,
+		)
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.opencodeGo, apiKey: "fresh-key" },
+			expect.anything(),
+		)
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "routerModels",
 			routerModels: {
@@ -571,7 +1288,7 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 					"opencode/model": expect.objectContaining({ description: "Opencode model" }),
 				},
 			},
-			values: { provider: "opencode-go" },
+			values: { provider: providerIdentifiers.opencodeGo },
 		})
 	})
 
@@ -591,13 +1308,20 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestRouterModels",
 			values: {
-				provider: "kenari",
+				provider: providerIdentifiers.kenari,
 				kenariApiKey: "fresh-kenari-key",
 			},
 		})
 
-		expect(mockFlushModels).toHaveBeenCalledWith({ provider: "kenari", apiKey: "fresh-kenari-key" }, true)
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "kenari", apiKey: "fresh-kenari-key" })
+		expect(mockFlushModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.kenari, apiKey: "fresh-kenari-key" },
+			expect.anything(),
+			true,
+		)
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.kenari, apiKey: "fresh-kenari-key" },
+			expect.anything(),
+		)
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "routerModels",
 			routerModels: {
@@ -605,7 +1329,7 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 					"glm-5-2": expect.objectContaining({ description: "Kenari model" }),
 				},
 			},
-			values: { provider: "kenari" },
+			values: { provider: providerIdentifiers.kenari },
 		})
 	})
 
@@ -617,11 +1341,38 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestRouterModels",
-			values: { provider: "nanogpt" },
+			values: { provider: providerIdentifiers.nanogpt },
 		})
 
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: undefined })
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: undefined },
+			expect.anything(),
+		)
 		expect(mockFlushModels).not.toHaveBeenCalled()
+	})
+
+	it("fetches only Friendli when the provider filter is friendli", async () => {
+		mockClineProvider.getState = vi.fn().mockResolvedValue({ apiConfiguration: {} })
+		mockGetModels.mockResolvedValue({
+			"zai-org/GLM-5.2": { maxTokens: 131072, contextWindow: 1000000, supportsPromptCache: true },
+		})
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestRouterModels",
+			values: { provider: providerIdentifiers.friendli },
+		})
+
+		expect(mockGetModels).toHaveBeenCalledTimes(1)
+		expect(mockGetModels).toHaveBeenCalledWith({ provider: providerIdentifiers.friendli }, expect.anything())
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "routerModels",
+			routerModels: {
+				friendli: {
+					"zai-org/GLM-5.2": expect.objectContaining({ contextWindow: 1000000 }),
+				},
+			},
+			values: { provider: providerIdentifiers.friendli },
+		})
 	})
 
 	it("prefers an unsaved NanoGPT key and refreshes the matching key-scoped cache", async () => {
@@ -634,11 +1385,18 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestRouterModels",
-			values: { provider: "nanogpt", nanoGptApiKey: "unsaved-key" },
+			values: { provider: providerIdentifiers.nanogpt, nanoGptApiKey: "unsaved-key" },
 		})
 
-		expect(mockFlushModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: "unsaved-key" }, true)
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: "unsaved-key" })
+		expect(mockFlushModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: "unsaved-key" },
+			expect.anything(),
+			true,
+		)
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: "unsaved-key" },
+			expect.anything(),
+		)
 	})
 
 	it("uses the saved NanoGPT key for manual refresh", async () => {
@@ -649,11 +1407,18 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestRouterModels",
-			values: { provider: "nanogpt", refresh: true },
+			values: { provider: providerIdentifiers.nanogpt, refresh: true },
 		})
 
-		expect(mockFlushModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: "saved-key" }, true)
-		expect(mockGetModels).toHaveBeenCalledWith({ provider: "nanogpt", apiKey: "saved-key" })
+		expect(mockFlushModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: "saved-key" },
+			expect.anything(),
+			true,
+		)
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{ provider: providerIdentifiers.nanogpt, apiKey: "saved-key" },
+			expect.anything(),
+		)
 	})
 
 	it("handles LiteLLM models with values from message when config is missing", async () => {
@@ -685,11 +1450,14 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		})
 
 		// Verify LiteLLM was called with values from message
-		expect(mockGetModels).toHaveBeenCalledWith({
-			provider: "litellm",
-			apiKey: "message-litellm-key",
-			baseUrl: "http://message-url:4000",
-		})
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.litellm,
+				apiKey: "message-litellm-key",
+				baseUrl: "http://message-url:4000",
+			},
+			expect.anything(),
+		)
 	})
 
 	it("skips LiteLLM when both config and message values are missing", async () => {
@@ -720,8 +1488,9 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		// Verify LiteLLM was NOT called
 		expect(mockGetModels).not.toHaveBeenCalledWith(
 			expect.objectContaining({
-				provider: "litellm",
+				provider: providerIdentifiers.litellm,
 			}),
+			expect.anything(),
 		)
 
 		// Verify response includes empty object for LiteLLM
@@ -741,8 +1510,10 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 				moonshot: {},
 				"opencode-go": mockModels,
 				kenari: mockModels,
+				"io-intelligence": mockModels,
 				nanogpt: mockModels,
 				"kimi-code": {},
+				friendli: mockModels,
 			},
 			values: undefined,
 		})
@@ -768,6 +1539,7 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 			.mockRejectedValueOnce(new Error("LiteLLM connection failed")) // litellm
 			.mockResolvedValueOnce(mockModels) // opencode-go
 			.mockResolvedValueOnce(mockModels) // kenari
+			.mockResolvedValueOnce(mockModels) // io-intelligence
 			.mockResolvedValueOnce(mockModels) // nanogpt
 
 		await webviewMessageHandler(mockClineProvider, {
@@ -779,14 +1551,14 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Requesty API error",
-			values: { provider: "requesty" },
+			values: { provider: providerIdentifiers.requesty },
 		})
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "LiteLLM connection failed",
-			values: { provider: "litellm" },
+			values: { provider: providerIdentifiers.litellm },
 		})
 
 		// Verify final routerModels response includes successful providers and empty objects for failed ones
@@ -806,8 +1578,10 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 				moonshot: {},
 				"opencode-go": mockModels,
 				kenari: mockModels,
+				"io-intelligence": mockModels,
 				nanogpt: mockModels,
 				"kimi-code": {},
+				friendli: mockModels,
 			},
 			values: undefined,
 		})
@@ -832,35 +1606,35 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Structured error message",
-			values: { provider: "openrouter" },
+			values: { provider: providerIdentifiers.openrouter },
 		})
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Requesty API error",
-			values: { provider: "requesty" },
+			values: { provider: providerIdentifiers.requesty },
 		})
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Unbound error",
-			values: { provider: "unbound" },
+			values: { provider: providerIdentifiers.unbound },
 		})
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Vercel AI Gateway error",
-			values: { provider: "vercel-ai-gateway" },
+			values: { provider: providerIdentifiers.vercelAiGateway },
 		})
 
 		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "LiteLLM connection failed",
-			values: { provider: "litellm" },
+			values: { provider: providerIdentifiers.litellm },
 		})
 	})
 
@@ -873,7 +1647,7 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 			type: "singleRouterModelFetchResponse",
 			success: false,
 			error: "Roo Code Router has been removed. Please select and configure a different provider.",
-			values: { provider: "roo" },
+			values: { provider: retiredProviderIdentifiers.roo },
 		})
 	})
 
@@ -890,11 +1664,14 @@ describe("webviewMessageHandler - requestRouterModels", () => {
 		})
 
 		// Verify message values take precedence over saved config (current unsaved field state wins)
-		expect(mockGetModels).toHaveBeenCalledWith({
-			provider: "litellm",
-			apiKey: "message-key", // From message.values
-			baseUrl: "http://message-url", // From message.values
-		})
+		expect(mockGetModels).toHaveBeenCalledWith(
+			{
+				provider: providerIdentifiers.litellm,
+				apiKey: "message-key", // From message.values
+				baseUrl: "http://message-url", // From message.values
+			},
+			expect.anything(),
+		)
 	})
 })
 
@@ -1224,6 +2001,125 @@ describe("webviewMessageHandler - destructiveCommandGuardEnabled", () => {
 
 		expect(ensureDcgInstalled).not.toHaveBeenCalled()
 		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("destructiveCommandGuardEnabled", false)
+	})
+})
+
+// A plain boolean needs no normalization branch in the updateSettings loop,
+// so this pins the generic persistence path: every polarity, including an
+// explicit unset (undefined), must reach ContextProxy verbatim rather than
+// being defaulted away.
+it("persists alwaysDenyUnapprovedCommands through the generic updateSettings loop", async () => {
+	vi.clearAllMocks()
+
+	await webviewMessageHandler(mockClineProvider, {
+		type: "updateSettings",
+		updatedSettings: { alwaysDenyUnapprovedCommands: true },
+	})
+
+	expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("alwaysDenyUnapprovedCommands", true)
+	expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+
+	vi.clearAllMocks()
+	await webviewMessageHandler(mockClineProvider, {
+		type: "updateSettings",
+		updatedSettings: { alwaysDenyUnapprovedCommands: false },
+	})
+
+	expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("alwaysDenyUnapprovedCommands", false)
+	expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+
+	vi.clearAllMocks()
+	await webviewMessageHandler(mockClineProvider, {
+		type: "updateSettings",
+		updatedSettings: { alwaysDenyUnapprovedCommands: undefined },
+	})
+
+	expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("alwaysDenyUnapprovedCommands", undefined)
+	expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+})
+
+// Both allowlists are normalized by the same branch, so both are held to the
+// same contract.
+describe.each(["allowedReadFiles", "allowedWriteFiles"] as const)("webviewMessageHandler - %s", (key) => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("persists the configured patterns", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { [key]: ["notes.md", "docs/scratch/**"] },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(key, ["notes.md", "docs/scratch/**"])
+	})
+
+	it("drops entries that cannot name a file", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			// The double assertion stands in for an untyped payload: the message
+			// arrives as JSON from the webview, so a non-string can reach the
+			// handler even though the type says otherwise. That is what the
+			// handler's `typeof` filter is there to catch, so the test has to be
+			// able to express it.
+			updatedSettings: { [key]: ["notes.md", "", "   ", 42 as unknown as string] },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(key, ["notes.md"])
+	})
+
+	// Whitespace is significant in gitignore syntax, so it must survive saving.
+	it("keeps whitespace within a pattern", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { [key]: [" notes.md", "my notes.md", "notes.md\\ "] },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(key, [
+			" notes.md",
+			"my notes.md",
+			"notes.md\\ ",
+		])
+	})
+
+	it("persists an empty list when the setting is cleared", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { [key]: [] },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(key, [])
+	})
+
+	// Unlike allowed/denied commands, these settings have no
+	// workspace-configuration counterpart, so nothing should be written to VS
+	// Code settings.
+	it("does not write to the VS Code workspace configuration", async () => {
+		const update = vi.fn()
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({ update } as never)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { [key]: ["notes.md"] },
+		})
+
+		expect(update).not.toHaveBeenCalled()
+	})
+})
+
+describe("webviewMessageHandler - allowlists together", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("persists both allowlists from one save", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { allowedReadFiles: ["read.md"], allowedWriteFiles: ["write.md"] },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("allowedReadFiles", ["read.md"])
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("allowedWriteFiles", ["write.md"])
 	})
 })
 
@@ -1631,23 +2527,23 @@ describe("zooCodeSignOut", () => {
 
 		;(mockClineProvider as any).contextProxy = {
 			...mockClineProvider.contextProxy,
-			getProviderSettings: vi.fn().mockReturnValue({ apiProvider: "zoo-gateway" }),
+			getProviderSettings: vi.fn().mockReturnValue({ apiProvider: providerIdentifiers.zooGateway }),
 			getValues: vi.fn().mockReturnValue({ currentApiConfigName: "Zoo Gateway" }),
 		}
 		;(mockClineProvider as any).providerSettingsManager = {
 			listConfig: vi.fn().mockResolvedValue([
-				{ name: "Zoo Gateway", apiProvider: "zoo-gateway" },
-				{ name: "Backup Zoo", apiProvider: "zoo-gateway" },
+				{ name: "Zoo Gateway", apiProvider: providerIdentifiers.zooGateway },
+				{ name: "Backup Zoo", apiProvider: providerIdentifiers.zooGateway },
 			]),
 			getProfile: vi
 				.fn()
 				.mockResolvedValueOnce({
-					apiProvider: "zoo-gateway",
+					apiProvider: providerIdentifiers.zooGateway,
 					zooSessionToken: "token-active",
 					zooGatewayModelId: "anthropic/claude-sonnet-4",
 				})
 				.mockResolvedValueOnce({
-					apiProvider: "zoo-gateway",
+					apiProvider: providerIdentifiers.zooGateway,
 					zooSessionToken: "token-backup",
 				}),
 			saveConfig,
@@ -1674,13 +2570,15 @@ describe("zooCodeSignOut", () => {
 
 		;(mockClineProvider as any).contextProxy = {
 			...mockClineProvider.contextProxy,
-			getProviderSettings: vi.fn().mockReturnValue({ apiProvider: "zoo-gateway" }),
+			getProviderSettings: vi.fn().mockReturnValue({ apiProvider: providerIdentifiers.zooGateway }),
 			getValues: vi.fn().mockReturnValue({ currentApiConfigName: "Zoo Gateway" }),
 		}
 		;(mockClineProvider as any).providerSettingsManager = {
-			listConfig: vi.fn().mockResolvedValue([{ name: "Zoo Gateway", apiProvider: "zoo-gateway" }]),
+			listConfig: vi
+				.fn()
+				.mockResolvedValue([{ name: "Zoo Gateway", apiProvider: providerIdentifiers.zooGateway }]),
 			getProfile: vi.fn().mockResolvedValue({
-				apiProvider: "zoo-gateway",
+				apiProvider: providerIdentifiers.zooGateway,
 				zooGatewayModelId: "anthropic/claude-sonnet-4",
 			}),
 			saveConfig: vi.fn(),
@@ -1839,5 +2737,589 @@ describe("webviewMessageHandler - kimiCodeSignOut", () => {
 		await webviewMessageHandler(mockClineProvider, { type: "kimiCodeSignOut" })
 
 		expect(vscode.window.showErrorMessage).toHaveBeenCalledWith("Kimi Code sign out failed.")
+	})
+})
+
+describe("webviewMessageHandler - telemetrySetting", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.mocked(vscode.env).isTelemetryEnabled = true
+	})
+
+	// Regression test: TelemetryService.updateTelemetryState must be gated on
+	// vscode.env.isTelemetryEnabled in addition to the stored setting, matching
+	// extension.ts's onDidChangeTelemetryEnabled listener. Without this AND, a user
+	// clicking Accept in the webview could re-enable telemetry even while VS Code's
+	// global telemetry toggle is off.
+	it("does not enable telemetry when the user accepts but VS Code's global telemetry toggle is off", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+		vi.mocked(vscode.env).isTelemetryEnabled = false
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockReturnValue(undefined)
+
+		await webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "enabled" })
+
+		expect(TelemetryService.instance.updateTelemetryState).toHaveBeenCalledWith(false)
+	})
+
+	it("enables telemetry when the user accepts and VS Code's global telemetry toggle is on", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+		vi.mocked(vscode.env).isTelemetryEnabled = true
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockReturnValue(undefined)
+
+		await webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "enabled" })
+
+		expect(TelemetryService.instance.updateTelemetryState).toHaveBeenCalledWith(true)
+	})
+
+	it("keeps telemetry disabled when the user declines, regardless of VS Code's global toggle", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+		vi.mocked(vscode.env).isTelemetryEnabled = true
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockReturnValue(undefined)
+
+		await webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "disabled" })
+
+		expect(TelemetryService.instance.updateTelemetryState).toHaveBeenCalledWith(false)
+	})
+
+	// Finding #12 regression: without serialization, two concurrent "telemetrySetting" messages
+	// each capture their own isOptedIn in a closure and apply it to TelemetryService whenever
+	// their own persistence write resolves -- with no ordering guarantee between the two
+	// invocations. A slow first write racing a fast second write could let the *first*
+	// message's (now-stale) intent win the live telemetry state, even though the *second*
+	// message reflects the user's actual final choice.
+	it("applies the most recently sent telemetrySetting last, even if an earlier message's write is slower", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+		vi.mocked(vscode.env).isTelemetryEnabled = true
+
+		// Track the "stored" setting so the second call's getGlobalState read reflects
+		// whatever the first call has (or hasn't yet) written -- mirrors ContextProxy's real
+		// synchronous stateCache update inside setValue.
+		let storedSetting: string | undefined
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockImplementation(() => storedSetting)
+
+		let resolveSlowWrite!: () => void
+		const slowWrite = new Promise<void>((resolve) => {
+			resolveSlowWrite = resolve
+		})
+
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockImplementation(async (_key, value) => {
+			if (value === "disabled") {
+				// First message's write is slow -- resolves only after we explicitly release it
+				// below, once the second (fast) message has already been sent.
+				await slowWrite
+			}
+			storedSetting = value as string
+		})
+
+		// First message: turn telemetry off (slow write).
+		const first = webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "disabled" })
+
+		// Second message: turn telemetry back on (fast write), sent immediately after.
+		const second = webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "enabled" })
+
+		// Now let the first message's write proceed.
+		resolveSlowWrite()
+
+		await Promise.all([first, second])
+
+		// The user's final, most-recently-sent choice was "enabled" -- the live telemetry
+		// state must reflect that, not "disabled" from the stale, slower first message.
+		const calls = vi.mocked(TelemetryService.instance.updateTelemetryState).mock.calls
+		expect(calls.at(-1)).toEqual([true])
+	})
+
+	// CodeRabbit follow-up on the finding #12 fix: webviewDidLaunch's telemetry init read state
+	// via an async provider.getStateToPostToWebview().then(...) continuation, outside
+	// telemetrySettingQueue -- so it could resolve after a concurrent "telemetrySetting" message
+	// and clobber that message's queued (correct) update with a stale value. webviewDidLaunch now
+	// reads getGlobalState synchronously and is routed through the same queue.
+	it("does not let webviewDidLaunch's telemetry init race and clobber a concurrent telemetrySetting message", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+		vi.mocked(vscode.env).isTelemetryEnabled = true
+
+		// webviewDidLaunch starts out "unset" (disclosed opt-out default -- opted in). Scoped to
+		// the "telemetrySetting" key specifically -- webviewDidLaunch also calls
+		// updateGlobalState("customModes", ...) through the same contextProxy mock, which must
+		// not clobber storedSetting.
+		let storedSetting: string | undefined = "unset"
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockImplementation((key: string) =>
+			key === "telemetrySetting" ? storedSetting : undefined,
+		)
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockImplementation(async (key: string, value) => {
+			if (key === "telemetrySetting") {
+				storedSetting = value as string
+			}
+		})
+
+		vi.mocked(mockClineProvider.customModesManager.getCustomModes).mockResolvedValue([])
+		const providerForLaunch = mockClineProvider as unknown as {
+			getMcpHub: ReturnType<typeof vi.fn>
+			providerSettingsManager: { listConfig: ReturnType<typeof vi.fn> }
+			getStateToPostToWebview: ReturnType<typeof vi.fn>
+		}
+		providerForLaunch.getMcpHub = vi.fn().mockReturnValue(undefined)
+		providerForLaunch.providerSettingsManager = {
+			listConfig: vi.fn().mockResolvedValue(undefined),
+		}
+
+		// Deferred-promise handshake instead of setTimeout delays, so ordering is enforced
+		// explicitly rather than by racing real clock delays. Signals when webviewDidLaunch has
+		// taken its (pre-fix) state snapshot -- only fires under the *old* code path
+		// (provider.getStateToPostToWebview().then(...)); the fix never calls it at all.
+		let snapshotTaken!: () => void
+		const snapshotTakenPromise = new Promise<void>((resolve) => {
+			snapshotTaken = resolve
+		})
+		let releaseSnapshot!: () => void
+		const snapshotReleased = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve
+		})
+
+		// Snapshots storedSetting at call time (mirroring the real ClineProvider building its
+		// state object synchronously before any internal awaits), signals it was taken, then
+		// waits until the test explicitly releases it -- by which point the concurrent
+		// telemetrySetting write below has already landed, making the snapshot genuinely stale
+		// once its .then() callback finally runs.
+		providerForLaunch.getStateToPostToWebview = vi.fn().mockImplementation(async () => {
+			const snapshot = storedSetting
+			snapshotTaken()
+			await snapshotReleased
+			return { telemetrySetting: snapshot }
+		})
+
+		// webviewDidLaunch fires first (e.g. webview reload) -- its telemetry init is now queued
+		// behind telemetrySettingQueue rather than resolving independently.
+		const launch = webviewMessageHandler(mockClineProvider, { type: "webviewDidLaunch" })
+
+		// Wait for webviewDidLaunch to either take its (pre-fix) snapshot, or flush a fixed
+		// number of microtask turns as a same-tick fallback for the fixed code path (which never
+		// triggers that signal) -- enough for its synchronous prefix (await getCustomModes(),
+		// await updateGlobalState()) to run, without relying on a wall-clock timer.
+		await Promise.race([
+			snapshotTakenPromise,
+			(async () => {
+				for (let i = 0; i < 10; i++) {
+					await Promise.resolve()
+				}
+			})(),
+		])
+
+		// A concurrent "telemetrySetting" message turns telemetry off, and is awaited to
+		// completion -- including its own updateTelemetryState(false) call -- *before* the
+		// deferred (pre-fix-only) snapshot below is released. Against the pre-fix code, this
+		// proves the snapshot it captured earlier ("unset") is genuinely stale by the time its
+		// .then() callback finally runs: the user's real, later choice already landed.
+		const disable = webviewMessageHandler(mockClineProvider, { type: "telemetrySetting", text: "disabled" })
+		await disable
+
+		// Now release the deferred snapshot so a getStateToPostToWebview() call, if the old code
+		// path is exercised, resolves (with its already-captured, now-stale value) only after
+		// the disable write above has fully landed.
+		const snapshotResolved = vi.mocked(providerForLaunch.getStateToPostToWebview).mock.results[0]?.value as
+			Promise<unknown> | undefined
+		releaseSnapshot()
+
+		await Promise.all([launch, snapshotResolved])
+
+		// webviewDidLaunch's telemetry init is fire-and-forget from the handler's own point of
+		// view (the "webviewDidLaunch" case doesn't await it), so even awaiting
+		// getStateToPostToWebview() directly isn't enough to observe its .then() callback --
+		// flush one more microtask turn for that callback to run.
+		await Promise.resolve()
+
+		// The user's explicit "disabled" choice must be the final state -- webviewDidLaunch's
+		// queued re-application of the (by-then-stale) "unset"/opted-in state must not run after
+		// and override it.
+		const calls = vi.mocked(TelemetryService.instance.updateTelemetryState).mock.calls
+		expect(calls.at(-1)).toEqual([false])
+	})
+
+	// Review finding: webviewDidLaunch's queued telemetry update wasn't awaited by the
+	// "webviewDidLaunch" case, so a thrown error inside it was only ever caught by a later,
+	// unrelated queue link's leading .catch(() => undefined) -- silently swallowed rather than
+	// logged. Now awaited with its own .catch that logs via provider.log.
+	it("logs an error via provider.log if the queued telemetry init throws on launch", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(true)
+
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockImplementation((key: string) => {
+			if (key === "telemetrySetting") {
+				throw new Error("contextProxy read failed")
+			}
+			return undefined
+		})
+		vi.mocked(mockClineProvider.customModesManager.getCustomModes).mockResolvedValue([])
+		const providerForLaunch = mockClineProvider as unknown as {
+			getMcpHub: ReturnType<typeof vi.fn>
+			providerSettingsManager: { listConfig: ReturnType<typeof vi.fn> }
+			getStateToPostToWebview: ReturnType<typeof vi.fn>
+		}
+		providerForLaunch.getMcpHub = vi.fn().mockReturnValue(undefined)
+		providerForLaunch.providerSettingsManager = { listConfig: vi.fn().mockResolvedValue(undefined) }
+		providerForLaunch.getStateToPostToWebview = vi.fn().mockResolvedValue({ telemetrySetting: "unset" })
+
+		await webviewMessageHandler(mockClineProvider, { type: "webviewDidLaunch" })
+
+		expect(mockClineProvider.log).toHaveBeenCalledWith(
+			expect.stringContaining("Error initializing telemetry state on launch"),
+		)
+	})
+
+	// CodeRabbit finding: webviewDidLaunch's queued telemetry update called
+	// TelemetryService.instance directly, unlike the "telemetrySetting" case a few lines
+	// below which checks hasInstance() first. If webviewDidLaunch fires before the service
+	// is created (e.g. during activation), TelemetryService.instance throws -- and since
+	// this whole chain isn't awaited by the "webviewDidLaunch" case, that throw becomes an
+	// unhandled promise rejection instead of a no-op.
+	it("does not throw or update telemetry state when webviewDidLaunch fires before TelemetryService exists", async () => {
+		const { TelemetryService } = await import("@roo-code/telemetry")
+		vi.mocked(TelemetryService.hasInstance).mockReturnValue(false)
+
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockReturnValue("unset")
+		vi.mocked(mockClineProvider.customModesManager.getCustomModes).mockResolvedValue([])
+		const providerForLaunch = mockClineProvider as unknown as {
+			getMcpHub: ReturnType<typeof vi.fn>
+			providerSettingsManager: { listConfig: ReturnType<typeof vi.fn> }
+			getStateToPostToWebview: ReturnType<typeof vi.fn>
+		}
+		providerForLaunch.getMcpHub = vi.fn().mockReturnValue(undefined)
+		providerForLaunch.providerSettingsManager = { listConfig: vi.fn().mockResolvedValue(undefined) }
+		providerForLaunch.getStateToPostToWebview = vi.fn().mockResolvedValue({ telemetrySetting: "unset" })
+
+		await expect(webviewMessageHandler(mockClineProvider, { type: "webviewDidLaunch" })).resolves.not.toThrow()
+
+		// The queued telemetry update is fire-and-forget from the handler's own point of
+		// view -- flush a microtask turn so its .then() callback runs before asserting.
+		await Promise.resolve()
+
+		expect(TelemetryService.instance.updateTelemetryState).not.toHaveBeenCalled()
+	})
+})
+
+describe("webviewMessageHandler - experiments", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("persists dynamicThinkingEffort true merged with the saved experiments", async () => {
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockImplementation((key: string) =>
+			key === "experiments" ? { preventFocusDisruption: true } : undefined,
+		)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { experiments: { dynamicThinkingEffort: true } },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("experiments", {
+			preventFocusDisruption: true,
+			dynamicThinkingEffort: true,
+		})
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+
+	it("persists dynamicThinkingEffort false over a previously enabled value", async () => {
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockImplementation((key: string) =>
+			key === "experiments" ? { dynamicThinkingEffort: true } : undefined,
+		)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { experiments: { dynamicThinkingEffort: false } },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("experiments", {
+			dynamicThinkingEffort: false,
+		})
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+
+	it("persists the experiment defaults when no experiments are saved yet", async () => {
+		vi.mocked(mockClineProvider.contextProxy.getValue).mockReturnValue(undefined)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateSettings",
+			updatedSettings: { experiments: {} },
+		})
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("experiments", {
+			...experimentDefault,
+			dynamicThinkingEffort: false,
+		})
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+})
+
+describe("webviewMessageHandler - collapseCommandOutputByDefault", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it.each([true, false, undefined])(
+		"persists the output collapse preference (%s) without changing terminal mode",
+		async (value) => {
+			await webviewMessageHandler(mockClineProvider, {
+				type: "updateSettings",
+				updatedSettings: { collapseCommandOutputByDefault: value },
+			})
+			expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(
+				"collapseCommandOutputByDefault",
+				value,
+			)
+			expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalledWith(
+				"terminalShellIntegrationDisabled",
+				expect.anything(),
+			)
+			expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+		},
+	)
+})
+
+describe("updateProfileModel", () => {
+	let updateProfileModel: Mock<ClineProvider["updateProfileModel"]>
+
+	beforeEach(() => {
+		vi.clearAllMocks()
+		updateProfileModel = vi.fn<ClineProvider["updateProfileModel"]>().mockResolvedValue(undefined)
+		mockClineProvider.updateProfileModel = updateProfileModel
+	})
+
+	it("delegates a valid message to the provider", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateProfileModel",
+			text: "my-profile",
+			values: {
+				expectedProvider: providerIdentifiers.openrouter,
+				patch: { openRouterModelId: "a/b", reasoningEffort: null },
+			},
+		})
+
+		expect(updateProfileModel).toHaveBeenCalledWith("my-profile", providerIdentifiers.openrouter, {
+			openRouterModelId: "a/b",
+			reasoningEffort: null,
+		})
+	})
+
+	it.each([
+		["missing profile name", { values: { expectedProvider: providerIdentifiers.openrouter, patch: {} } }],
+		["missing expectedProvider", { text: "p", values: { patch: {} } }],
+		["non-object patch", { text: "p", values: { expectedProvider: providerIdentifiers.openrouter, patch: "x" } }],
+		["array patch", { text: "p", values: { expectedProvider: providerIdentifiers.openrouter, patch: [] } }],
+		["missing values", { text: "p" }],
+	])("ignores a malformed message: %s", async (_label, partial) => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "updateProfileModel",
+			...partial,
+		} as unknown as Parameters<typeof webviewMessageHandler>[1])
+
+		expect(updateProfileModel).not.toHaveBeenCalled()
+	})
+})
+
+describe("webviewMessageHandler - renameTaskWithId", () => {
+	beforeEach(() => {
+		vi.mocked(mockClineProvider.renameTaskWithId).mockClear()
+	})
+
+	it.each([
+		["forwards taskId and text", { taskId: "task-1", text: "New name" }, [["task-1", "New name"]]],
+		["forwards an empty title so the provider can clear it", { taskId: "task-1", text: "" }, [["task-1", ""]]],
+		["skips the call when taskId is missing", { text: "New name" }, []],
+	])("%s", async (_label, payload, expectedCalls) => {
+		await webviewMessageHandler(mockClineProvider, { type: "renameTaskWithId", ...payload })
+
+		expect(vi.mocked(mockClineProvider.renameTaskWithId).mock.calls).toEqual(expectedCalls)
+	})
+})
+
+// The display settings are written like any other setting, but the webview is not trusted: a value that its own
+// controls cannot produce (a hand-written message) is ignored before anything is done for it.
+describe("updateSettings with the display settings", () => {
+	const save = (updatedSettings: Record<string, unknown>) =>
+		webviewMessageHandler(mockClineProvider, { type: "updateSettings", updatedSettings })
+
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	afterEach(() => {
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockReset().mockResolvedValue(undefined)
+	})
+
+	it.each([
+		["timeFormat", "auto"],
+		["timeFormat", "12h"],
+		["timeFormat", "24h"],
+		["dateFormat", "auto"],
+		["dateFormat", "mdy"],
+		["dateFormat", "dmy"],
+		["dateFormat", "ymd"],
+		["showRelativeTimes", true],
+		["showRelativeTimes", false],
+		["timeFormat", undefined],
+		["showRelativeTimes", undefined],
+	])("persists %s = %j as it is", async (key, value) => {
+		await save({ [key]: value })
+
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith(key, value)
+		expect(mockClineProvider.log).not.toHaveBeenCalled()
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+
+	it.each([["de"], ["ja"], ["zh-TW"]])("applies and stores the display language %s", async (language) => {
+		await save({ language })
+
+		expect(changeLanguage).toHaveBeenCalledWith(language)
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("language", language)
+	})
+
+	it.each([[undefined], [null]])("uses the default language for %s", async (language) => {
+		await save({ language })
+
+		expect(changeLanguage).toHaveBeenCalledWith("en")
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("language", "en")
+	})
+
+	it.each([
+		["timeFormat", "13h"],
+		["timeFormat", 24],
+		["dateFormat", "dd/mm"],
+		["showRelativeTimes", "yes"],
+		["language", "xx-not-a-language"],
+		["language", 42],
+		["language", ""],
+	])("ignores %s = %j, and says so in the log", async (key, value) => {
+		await save({ [key]: value })
+
+		expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalledWith(key, expect.anything())
+		expect(changeLanguage).not.toHaveBeenCalled()
+		expect(mockClineProvider.log).toHaveBeenCalledWith(`[updateSettings] Ignored an invalid value for ${key}`)
+	})
+
+	it("still saves the other settings sent with an invalid display value, and refreshes the webview", async () => {
+		await save({ timeFormat: "13h", dateFormat: "ymd", soundEnabled: true })
+
+		expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalledWith("timeFormat", expect.anything())
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("dateFormat", "ymd")
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("soundEnabled", true)
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+
+	it("is not a transaction: if a write fails, the earlier ones stay, the later ones are not written, and the error is thrown", async () => {
+		const failure = new Error("storage unavailable")
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockImplementation(async (key) => {
+			if (key === "dateFormat") throw failure
+		})
+
+		await expect(save({ timeFormat: "24h", dateFormat: "ymd", showRelativeTimes: false })).rejects.toBe(failure)
+
+		const written = vi.mocked(mockClineProvider.contextProxy.setValue).mock.calls.map(([key]) => key)
+		expect(written).toEqual(["timeFormat", "dateFormat"])
+		// The webview is refreshed even so, to show what is really stored.
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(1)
+	})
+
+	describe("the save result", () => {
+		const saveWithId = (updatedSettings: Record<string, unknown>, requestId?: string) =>
+			webviewMessageHandler(mockClineProvider, { type: "updateSettings", requestId, updatedSettings })
+		const saveAs = (updatedSettings: Record<string, unknown>) => saveWithId(updatedSettings, "save-1")
+
+		const results = () =>
+			vi
+				.mocked(mockClineProvider.postMessageToWebview)
+				.mock.calls.map(([message]) => message)
+				.filter((message) => message.type === "settingsSaveResult")
+
+		it("reports a stored save, after the state was refreshed", async () => {
+			await saveAs({ timeFormat: "24h" })
+
+			expect(results()).toEqual([{ type: "settingsSaveResult", requestId: "save-1", success: true }])
+			const [refreshOrder] = vi.mocked(mockClineProvider.postStateToWebview).mock.invocationCallOrder
+			const [resultOrder] = vi.mocked(mockClineProvider.postMessageToWebview).mock.invocationCallOrder
+			expect(refreshOrder).toBeLessThan(resultOrder)
+		})
+
+		it.each([
+			["an Error", new Error("storage unavailable"), "storage unavailable"],
+			["something that is not an Error", "disk full", "disk full"],
+		])("reports a failed save with the reason, for %s, and still throws it", async (_name, failure, reason) => {
+			vi.mocked(mockClineProvider.contextProxy.setValue).mockRejectedValue(failure)
+
+			await expect(saveAs({ dateFormat: "ymd" })).rejects.toBe(failure)
+
+			expect(results()).toEqual([
+				{ type: "settingsSaveResult", requestId: "save-1", success: false, error: reason },
+			])
+		})
+
+		it("does nothing, and reports nothing, for a message that carries no settings", async () => {
+			await webviewMessageHandler(mockClineProvider, { type: "updateSettings", requestId: "save-1" })
+
+			expect(mockClineProvider.contextProxy.setValue).not.toHaveBeenCalled()
+			expect(mockClineProvider.postStateToWebview).not.toHaveBeenCalled()
+			expect(results()).toEqual([])
+		})
+
+		it("sends no result for a save that has no request id", async () => {
+			await saveWithId({ timeFormat: "24h" })
+
+			expect(results()).toEqual([])
+		})
+
+		it("still reports a stored save when refreshing the state fails", async () => {
+			vi.mocked(mockClineProvider.postStateToWebview).mockRejectedValueOnce(new Error("webview gone"))
+
+			await saveAs({ timeFormat: "24h" })
+
+			expect(results()).toEqual([{ type: "settingsSaveResult", requestId: "save-1", success: true }])
+			expect(mockClineProvider.log).toHaveBeenCalledWith(
+				"[updateSettings] Could not refresh the webview state: webview gone",
+			)
+		})
+
+		it("reports a failed save when refreshing the state fails too", async () => {
+			vi.mocked(mockClineProvider.contextProxy.setValue).mockRejectedValue(new Error("no"))
+			vi.mocked(mockClineProvider.postStateToWebview).mockRejectedValueOnce("webview gone")
+
+			await expect(saveAs({ timeFormat: "24h" })).rejects.toThrow("no")
+
+			expect(results()).toEqual([
+				{ type: "settingsSaveResult", requestId: "save-1", success: false, error: "no" },
+			])
+			expect(mockClineProvider.log).toHaveBeenCalledWith(
+				"[updateSettings] Could not refresh the webview state: webview gone",
+			)
+		})
+	})
+
+	it("completes a partial save when the same values are saved again", async () => {
+		let failOnce = true
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockImplementation(async (key) => {
+			if (key === "dateFormat" && failOnce) {
+				failOnce = false
+				throw new Error("storage unavailable")
+			}
+		})
+		const values = { timeFormat: "24h", dateFormat: "ymd", showRelativeTimes: false }
+
+		await expect(save(values)).rejects.toThrow("storage unavailable")
+		vi.mocked(mockClineProvider.contextProxy.setValue).mockClear()
+		await save(values)
+
+		const written = vi.mocked(mockClineProvider.contextProxy.setValue).mock.calls.map(([key]) => key)
+		expect(written).toEqual(["timeFormat", "dateFormat", "showRelativeTimes"])
+		expect(mockClineProvider.postStateToWebview).toHaveBeenCalledTimes(2) // once for the failed save, once for this one
+	})
+
+	it("does not take a key that only exists on every object for a display setting", async () => {
+		await save({ constructor: "x", toString: "y" })
+
+		expect(mockClineProvider.log).not.toHaveBeenCalled()
+		expect(mockClineProvider.contextProxy.setValue).toHaveBeenCalledWith("constructor", "x")
 	})
 })

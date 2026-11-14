@@ -1,3 +1,4 @@
+import { WebviewFocusTracker } from "../../webview/WebviewFocusTracker"
 // npx vitest core/task/__tests__/grace-retry-errors.spec.ts
 
 import * as os from "os"
@@ -10,6 +11,7 @@ import { TelemetryService } from "@roo-code/telemetry"
 import { Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
+import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 
 // Mock @roo-code/core
 vi.mock("@roo-code/core", () => ({
@@ -95,7 +97,7 @@ vi.mock("vscode", () => {
 				stat: vi.fn().mockResolvedValue({ type: 1 }),
 			},
 			onDidSaveTextDocument: vi.fn(() => mockDisposable),
-			getConfiguration: vi.fn(() => ({ get: (key: string, defaultValue: any) => defaultValue })),
+			getConfiguration: vi.fn(() => ({ get: (_key: string, defaultValue: any) => defaultValue })),
 		},
 		env: {
 			uriScheme: "vscode",
@@ -198,10 +200,11 @@ describe("Grace Retry Error Handling", () => {
 			mockOutputChannel,
 			"sidebar",
 			new ContextProxy(mockExtensionContext),
+			new WebviewFocusTracker(),
 		) as any
 
 		mockApiConfig = {
-			apiProvider: "anthropic",
+			apiProvider: providerIdentifiers.anthropic,
 			apiModelId: "claude-3-5-sonnet-20241022",
 			apiKey: "test-api-key",
 		}
@@ -236,7 +239,7 @@ describe("Grace Retry Error Handling", () => {
 			task.consecutiveNoAssistantMessagesCount = 5
 
 			// Mock dispose to prevent actual cleanup
-			vi.spyOn(task, "dispose").mockImplementation(() => {})
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
 
 			await task.abortTask()
 
@@ -256,7 +259,7 @@ describe("Grace Retry Error Handling", () => {
 			task.consecutiveNoToolUseCount = 4
 
 			// Mock dispose to prevent actual cleanup
-			vi.spyOn(task, "dispose").mockImplementation(() => {})
+			vi.spyOn(task, "dispose").mockResolvedValue(undefined)
 
 			await task.abortTask()
 

@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from "react"
 import { useEvent } from "react-use"
 import { Checkbox } from "vscrui"
-import { VSCodeButton, VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
+import { VSCodeButton, VSCodeTextArea, VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 
 import {
 	type ProviderSettings,
@@ -12,11 +12,14 @@ import {
 	azureOpenAiDefaultApiVersion,
 	isAzureOpenAiBaseUrl,
 	openAiModelInfoSaneDefaults,
+	DEFAULT_OPEN_AI_STRICT_TOOL_SCHEMAS,
 	OpenAiModelsMessageType,
+	parseOpenAiExtraBody,
 } from "@roo-code/types"
 
 import { useAppTranslation } from "@src/i18n/TranslationContext"
 import { Button, StandardTooltip } from "@src/components/ui"
+import { formatOpenAiExtraBodyValidationError } from "@src/utils/validate"
 
 import { convertHeadersToObject } from "../utils/headers"
 import { inputEventTransform, noTransform } from "../transforms"
@@ -44,16 +47,18 @@ export const OpenAICompatible = ({
 	simplifySettings,
 }: OpenAICompatibleProps) => {
 	const { t } = useAppTranslation()
-	const isAzureOpenAi = isAzureOpenAiBaseUrl(apiConfiguration?.openAiBaseUrl, apiConfiguration?.openAiUseAzure)
+	const isAzureOpenAi = isAzureOpenAiBaseUrl(apiConfiguration.openAiBaseUrl, apiConfiguration.openAiUseAzure)
 
-	const [azureApiVersionSelected, setAzureApiVersionSelected] = useState(!!apiConfiguration?.azureApiVersion)
+	const [azureApiVersionSelected, setAzureApiVersionSelected] = useState(!!apiConfiguration.azureApiVersion)
 
 	const [openAiModels, setOpenAiModels] = useState<Record<string, ModelInfo> | null>(null)
 
 	const [customHeaders, setCustomHeaders] = useState<[string, string][]>(() => {
-		const headers = apiConfiguration?.openAiHeaders || {}
+		const headers = apiConfiguration.openAiHeaders || {}
 		return Object.entries(headers)
 	})
+	const extraBodyResult = parseOpenAiExtraBody(apiConfiguration.openAiExtraBody)
+	const extraBodyError = formatOpenAiExtraBodyValidationError(extraBodyResult, t)
 
 	const handleAddCustomHeader = useCallback(() => {
 		// Only update the local state to show the new row in the UI.
@@ -129,7 +134,7 @@ export const OpenAICompatible = ({
 	return (
 		<>
 			<VSCodeTextField
-				value={apiConfiguration?.openAiBaseUrl || ""}
+				value={apiConfiguration.openAiBaseUrl || ""}
 				type="url"
 				onInput={handleInputChange("openAiBaseUrl")}
 				placeholder={
@@ -141,7 +146,7 @@ export const OpenAICompatible = ({
 				<label className="block font-medium mb-1">{t("settings:providers.openAiBaseUrl")}</label>
 			</VSCodeTextField>
 			<VSCodeTextField
-				value={apiConfiguration?.openAiApiKey || ""}
+				value={apiConfiguration.openAiApiKey || ""}
 				type="password"
 				onInput={handleInputChange("openAiApiKey")}
 				placeholder={t("settings:placeholders.apiKey")}
@@ -168,16 +173,16 @@ export const OpenAICompatible = ({
 			)}
 			<R1FormatSetting
 				onChange={handleInputChange("openAiR1FormatEnabled", noTransform)}
-				openAiR1FormatEnabled={apiConfiguration?.openAiR1FormatEnabled ?? false}
+				openAiR1FormatEnabled={apiConfiguration.openAiR1FormatEnabled ?? false}
 			/>
 			<Checkbox
-				checked={apiConfiguration?.openAiStreamingEnabled ?? true}
+				checked={apiConfiguration.openAiStreamingEnabled ?? true}
 				onChange={handleInputChange("openAiStreamingEnabled", noTransform)}>
 				{t("settings:modelInfo.enableStreaming")}
 			</Checkbox>
 			<div>
 				<Checkbox
-					checked={apiConfiguration?.includeMaxTokens ?? true}
+					checked={apiConfiguration.includeMaxTokens ?? true}
 					onChange={handleInputChange("includeMaxTokens", noTransform)}>
 					{t("settings:includeMaxOutputTokens")}
 				</Checkbox>
@@ -185,8 +190,18 @@ export const OpenAICompatible = ({
 					{t("settings:includeMaxOutputTokensDescription")}
 				</div>
 			</div>
+			<div>
+				<Checkbox
+					checked={apiConfiguration.openAiStrictToolSchemas ?? DEFAULT_OPEN_AI_STRICT_TOOL_SCHEMAS}
+					onChange={handleInputChange("openAiStrictToolSchemas", noTransform)}>
+					{t("settings:providers.openAiStrictToolSchemas")}
+				</Checkbox>
+				<div className="text-sm text-vscode-descriptionForeground ml-6">
+					{t("settings:providers.openAiStrictToolSchemasDescription")}
+				</div>
+			</div>
 			<Checkbox
-				checked={apiConfiguration?.openAiUseAzure ?? false}
+				checked={apiConfiguration.openAiUseAzure ?? false}
 				onChange={handleInputChange("openAiUseAzure", noTransform)}>
 				{t("settings:modelInfo.useAzure")}
 			</Checkbox>
@@ -204,7 +219,7 @@ export const OpenAICompatible = ({
 				</Checkbox>
 				{azureApiVersionSelected && (
 					<VSCodeTextField
-						value={apiConfiguration?.azureApiVersion || ""}
+						value={apiConfiguration.azureApiVersion || ""}
 						onInput={handleInputChange("azureApiVersion")}
 						placeholder={`Default: ${azureOpenAiDefaultApiVersion}`}
 						className="w-full mt-1"
@@ -248,6 +263,36 @@ export const OpenAICompatible = ({
 							</StandardTooltip>
 						</div>
 					))
+				)}
+			</div>
+
+			<div className="mb-4">
+				<label id="openai-extra-body-label" className="block font-medium mb-1">
+					{t("settings:providers.extraBody")}
+				</label>
+				<div id="openai-extra-body-description" className="text-sm text-vscode-descriptionForeground mb-2">
+					{t("settings:providers.extraBodyDescription")}
+				</div>
+				<VSCodeTextArea
+					resize="vertical"
+					rows={5}
+					value={apiConfiguration.openAiExtraBody ?? ""}
+					onInput={handleInputChange("openAiExtraBody")}
+					placeholder={'{\n  "metadata": {\n    "completion_window": "balanced"\n  }\n}'}
+					className="w-full font-mono"
+					aria-labelledby="openai-extra-body-label"
+					aria-describedby={
+						extraBodyError
+							? "openai-extra-body-description openai-extra-body-error"
+							: "openai-extra-body-description"
+					}
+					aria-invalid={extraBodyError ? "true" : undefined}
+					data-testid="openai-extra-body-input"
+				/>
+				{extraBodyError && (
+					<div id="openai-extra-body-error" className="text-sm text-vscode-errorForeground mt-1" role="alert">
+						{extraBodyError}
+					</div>
 				)}
 			</div>
 
@@ -298,14 +343,14 @@ export const OpenAICompatible = ({
 				<div>
 					<VSCodeTextField
 						value={
-							apiConfiguration?.openAiCustomModelInfo?.maxTokens?.toString() ||
+							apiConfiguration.openAiCustomModelInfo?.maxTokens?.toString() ||
 							openAiModelInfoSaneDefaults.maxTokens?.toString() ||
 							""
 						}
 						type="text"
 						style={{
 							borderColor: (() => {
-								const value = apiConfiguration?.openAiCustomModelInfo?.maxTokens
+								const value = apiConfiguration.openAiCustomModelInfo?.maxTokens
 
 								if (!value) {
 									return "var(--vscode-input-border)"
@@ -318,7 +363,7 @@ export const OpenAICompatible = ({
 							const value = parseInt((e.target as HTMLInputElement).value)
 
 							return {
-								...(apiConfiguration?.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
+								...(apiConfiguration.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
 								maxTokens: isNaN(value) ? undefined : value,
 							}
 						})}
@@ -336,14 +381,14 @@ export const OpenAICompatible = ({
 				<div>
 					<VSCodeTextField
 						value={
-							apiConfiguration?.openAiCustomModelInfo?.contextWindow?.toString() ||
+							apiConfiguration.openAiCustomModelInfo?.contextWindow?.toString() ||
 							openAiModelInfoSaneDefaults.contextWindow?.toString() ||
 							""
 						}
 						type="text"
 						style={{
 							borderColor: (() => {
-								const value = apiConfiguration?.openAiCustomModelInfo?.contextWindow
+								const value = apiConfiguration.openAiCustomModelInfo?.contextWindow
 
 								if (!value) {
 									return "var(--vscode-input-border)"
@@ -357,7 +402,7 @@ export const OpenAICompatible = ({
 							const parsed = parseInt(value)
 
 							return {
-								...(apiConfiguration?.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
+								...(apiConfiguration.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
 								contextWindow: isNaN(parsed) ? openAiModelInfoSaneDefaults.contextWindow : parsed,
 							}
 						})}
@@ -376,12 +421,12 @@ export const OpenAICompatible = ({
 					<div className="flex items-center gap-1">
 						<Checkbox
 							checked={
-								apiConfiguration?.openAiCustomModelInfo?.supportsImages ??
+								apiConfiguration.openAiCustomModelInfo?.supportsImages ??
 								openAiModelInfoSaneDefaults.supportsImages
 							}
 							onChange={handleInputChange("openAiCustomModelInfo", (checked) => {
 								return {
-									...(apiConfiguration?.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
+									...(apiConfiguration.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
 									supportsImages: checked,
 								}
 							})}>
@@ -404,10 +449,10 @@ export const OpenAICompatible = ({
 				<div>
 					<div className="flex items-center gap-1">
 						<Checkbox
-							checked={apiConfiguration?.openAiCustomModelInfo?.supportsPromptCache ?? false}
+							checked={apiConfiguration.openAiCustomModelInfo?.supportsPromptCache ?? false}
 							onChange={handleInputChange("openAiCustomModelInfo", (checked) => {
 								return {
-									...(apiConfiguration?.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
+									...(apiConfiguration.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
 									supportsPromptCache: checked,
 								}
 							})}>
@@ -428,14 +473,14 @@ export const OpenAICompatible = ({
 				<div>
 					<VSCodeTextField
 						value={
-							apiConfiguration?.openAiCustomModelInfo?.inputPrice?.toString() ??
+							apiConfiguration.openAiCustomModelInfo?.inputPrice?.toString() ??
 							openAiModelInfoSaneDefaults.inputPrice?.toString() ??
 							""
 						}
 						type="text"
 						style={{
 							borderColor: (() => {
-								const value = apiConfiguration?.openAiCustomModelInfo?.inputPrice
+								const value = apiConfiguration.openAiCustomModelInfo?.inputPrice
 
 								if (!value && value !== 0) {
 									return "var(--vscode-input-border)"
@@ -449,7 +494,7 @@ export const OpenAICompatible = ({
 							const parsed = parseFloat(value)
 
 							return {
-								...(apiConfiguration?.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
+								...(apiConfiguration.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
 								inputPrice: isNaN(parsed) ? openAiModelInfoSaneDefaults.inputPrice : parsed,
 							}
 						})}
@@ -472,14 +517,14 @@ export const OpenAICompatible = ({
 				<div>
 					<VSCodeTextField
 						value={
-							apiConfiguration?.openAiCustomModelInfo?.outputPrice?.toString() ||
+							apiConfiguration.openAiCustomModelInfo?.outputPrice?.toString() ||
 							openAiModelInfoSaneDefaults.outputPrice?.toString() ||
 							""
 						}
 						type="text"
 						style={{
 							borderColor: (() => {
-								const value = apiConfiguration?.openAiCustomModelInfo?.outputPrice
+								const value = apiConfiguration.openAiCustomModelInfo?.outputPrice
 
 								if (!value && value !== 0) {
 									return "var(--vscode-input-border)"
@@ -493,7 +538,7 @@ export const OpenAICompatible = ({
 							const parsed = parseFloat(value)
 
 							return {
-								...(apiConfiguration?.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
+								...(apiConfiguration.openAiCustomModelInfo || openAiModelInfoSaneDefaults),
 								outputPrice: isNaN(parsed) ? openAiModelInfoSaneDefaults.outputPrice : parsed,
 							}
 						})}
@@ -513,15 +558,15 @@ export const OpenAICompatible = ({
 					</VSCodeTextField>
 				</div>
 
-				{apiConfiguration?.openAiCustomModelInfo?.supportsPromptCache && (
+				{apiConfiguration.openAiCustomModelInfo?.supportsPromptCache && (
 					<>
 						<div>
 							<VSCodeTextField
-								value={apiConfiguration?.openAiCustomModelInfo?.cacheReadsPrice?.toString() ?? "0"}
+								value={apiConfiguration.openAiCustomModelInfo?.cacheReadsPrice?.toString() ?? "0"}
 								type="text"
 								style={{
 									borderColor: (() => {
-										const value = apiConfiguration?.openAiCustomModelInfo?.cacheReadsPrice
+										const value = apiConfiguration.openAiCustomModelInfo?.cacheReadsPrice
 
 										if (!value && value !== 0) {
 											return "var(--vscode-input-border)"
@@ -537,7 +582,7 @@ export const OpenAICompatible = ({
 									const parsed = parseFloat(value)
 
 									return {
-										...(apiConfiguration?.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
+										...(apiConfiguration.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
 										cacheReadsPrice: isNaN(parsed) ? 0 : parsed,
 									}
 								})}
@@ -559,11 +604,11 @@ export const OpenAICompatible = ({
 						</div>
 						<div>
 							<VSCodeTextField
-								value={apiConfiguration?.openAiCustomModelInfo?.cacheWritesPrice?.toString() ?? "0"}
+								value={apiConfiguration.openAiCustomModelInfo?.cacheWritesPrice?.toString() ?? "0"}
 								type="text"
 								style={{
 									borderColor: (() => {
-										const value = apiConfiguration?.openAiCustomModelInfo?.cacheWritesPrice
+										const value = apiConfiguration.openAiCustomModelInfo?.cacheWritesPrice
 
 										if (!value && value !== 0) {
 											return "var(--vscode-input-border)"
@@ -579,7 +624,7 @@ export const OpenAICompatible = ({
 									const parsed = parseFloat(value)
 
 									return {
-										...(apiConfiguration?.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
+										...(apiConfiguration.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
 										cacheWritesPrice: isNaN(parsed) ? 0 : parsed,
 									}
 								})}

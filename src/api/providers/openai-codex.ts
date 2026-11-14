@@ -11,8 +11,8 @@ import {
 	OpenAiCodexModelId,
 	openAiCodexModels,
 	SERVICE_TIER_KEY,
-	type ReasoningEffort,
 	type ReasoningEffortExtended,
+	type VerbosityLevel,
 	ApiProviderError,
 } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
@@ -29,6 +29,13 @@ import { isMcpTool } from "../../utils/mcp-name"
 import { sanitizeOpenAiCallId } from "../../utils/tool-id"
 import { openAiCodexOAuthManager } from "../../integrations/openai-codex/oauth"
 import { t } from "../../i18n"
+import {
+	createAbortError,
+	isRequestAborted,
+	mergeAbortSignalAndTimeout,
+	rejectOnAbort,
+	throwIfAborted,
+} from "./utils/abort-signal"
 
 export type OpenAiCodexModel = ReturnType<OpenAiCodexHandler["getModel"]>
 
@@ -41,6 +48,19 @@ type OpenAiCodexRequestServiceTier = typeof OpenAiCodexServiceTier.Priority
 const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api/codex"
 const LUNA_MODEL_ID = "gpt-5.6-luna"
 const LUNA_CODEX_VERSION = "0.144.0"
+const RESPONSES_LITE_MODEL_IDS = new Set<OpenAiCodexModelId>([
+	LUNA_MODEL_ID,
+	"gpt-6-astra",
+	"gpt-6.1-sol",
+	"gpt-6.1-terra",
+])
+
+/**
+ * A refusal is streamed as text so the chat still shows why the model declined, but it is not part
+ * of the answer: the Responses API keeps refusals out of `output_text`. `completePrompt` relies on
+ * this prefix to tell the two apart, so both refusal branches must emit it.
+ */
+const REFUSAL_TEXT_PREFIX = "[Refusal] "
 
 const getOpenAiCodexServiceTier = (options: ApiHandlerOptions): OpenAiCodexRequestServiceTier | undefined =>
 	options[OPEN_AI_CODEX_SERVICE_TIER_KEY] === OpenAiCodexServiceTier.Priority
@@ -63,15 +83,15 @@ function stripInputImageDetail(value: any): any {
 	)
 }
 
-export function transformLunaResponsesLiteBody(requestBody: any, effectiveSessionId: string): any {
+export function transformResponsesLiteBody(requestBody: any, effectiveSessionId: string): any {
 	if (!Array.isArray(requestBody.input)) {
-		throw new Error("Invalid gpt-5.6-luna Responses Lite request: input must be an array.")
+		throw new Error("Invalid Responses Lite request: input must be an array.")
 	}
 	if (requestBody.tools !== undefined && !Array.isArray(requestBody.tools)) {
-		throw new Error("Invalid gpt-5.6-luna Responses Lite request: tools must be an array when provided.")
+		throw new Error("Invalid Responses Lite request: tools must be an array when provided.")
 	}
 	if (requestBody.instructions !== undefined && typeof requestBody.instructions !== "string") {
-		throw new Error("Invalid gpt-5.6-luna Responses Lite request: instructions must be a string when provided.")
+		throw new Error("Invalid Responses Lite request: instructions must be a string when provided.")
 	}
 
 	const { tools, instructions, ...rest } = requestBody
@@ -96,12 +116,12 @@ export function transformLunaResponsesLiteBody(requestBody: any, effectiveSessio
 				: []),
 			...transformedInput,
 		],
-		// Luna Responses Lite requires these exact values, so they intentionally
+		// Responses Lite requires these exact values, so they intentionally
 		// override any caller-supplied tool_choice or parallel_tool_calls.
 		tool_choice: "auto",
 		parallel_tool_calls: false,
 		prompt_cache_key: effectiveSessionId,
-		// Luna Responses Lite requires reasoning context "all_turns"; this intentionally
+		// Responses Lite requires reasoning context "all_turns"; this intentionally
 		// overwrites any context value already present in the incoming reasoning config.
 		reasoning: { ...reasoning, context: "all_turns" },
 	}
@@ -125,8 +145,6 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 	private lastResponseOutput: any[] | undefined
 	// Last top-level response id
 	private lastResponseId: string | undefined
-	// Abort controller for cancelling ongoing requests
-	private abortController?: AbortController
 	// Session ID for the Codex API (persists for the lifetime of the handler)
 	private readonly sessionId: string
 	/**
@@ -142,6 +160,10 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 	private sawTextDeltaInCurrentResponse = false
 	// Tracks tool call IDs emitted via streaming partial events to prevent done-event duplicates.
 	private streamedToolCallIds = new Set<string>()
+	// Tracks whether the SDK stream produced an event, which is the point where the service has
+	// accepted the request and its output is already with the caller. Neither transport may be
+	// replayed after that: doing so appends a second generation to the first.
+	private sawSdkEventInCurrentResponse = false
 
 	// Event types handled by the shared event processor
 	private readonly coreHandledEventTypes = new Set<string>([
@@ -173,7 +195,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		this.sessionId = uuidv7()
 	}
 
-	private normalizeUsage(usage: any, model: OpenAiCodexModel): ApiStreamUsageChunk | undefined {
+	private normalizeUsage(usage: any, _model: OpenAiCodexModel): ApiStreamUsageChunk | undefined {
 		if (!usage) return undefined
 
 		const inputDetails = usage.input_tokens_details ?? usage.prompt_tokens_details
@@ -217,7 +239,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		metadata?: ApiHandlerCreateMessageMetadata,
 	): ApiStream {
 		const model = this.getModel()
-		yield* this.handleResponsesApiMessage(model, systemPrompt, messages, metadata)
+		yield* this.handleResponsesApiMessage(model, systemPrompt, messages, metadata, metadata?.abortSignal)
 	}
 
 	private async *handleResponsesApiMessage(
@@ -225,6 +247,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		systemPrompt: string,
 		messages: Anthropic.Messages.MessageParam[],
 		metadata?: ApiHandlerCreateMessageMetadata,
+		abortSignal?: AbortSignal,
 	): ApiStream {
 		// Reset state for this request
 		this.lastResponseOutput = undefined
@@ -233,10 +256,33 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		this.pendingToolCallName = undefined
 		this.sawTextOutputInCurrentResponse = false
 		this.sawTextDeltaInCurrentResponse = false
+		this.sawSdkEventInCurrentResponse = false
 		this.streamedToolCallIds.clear()
 
 		// Get access token from OAuth manager
-		let accessToken = await openAiCodexOAuthManager.getAccessToken()
+		// The lookup can await credential loading, token refresh, and persistence: race it against
+		// the caller's signal so a cancelled request settles immediately instead of hanging on a
+		// lookup that no longer matters.
+		let accessToken: string | null
+		try {
+			if (abortSignal) {
+				accessToken = await rejectOnAbort(
+					openAiCodexOAuthManager.getAccessToken(),
+					abortSignal,
+					this.providerName,
+				)
+			} else {
+				accessToken = await openAiCodexOAuthManager.getAccessToken()
+			}
+		} catch (error) {
+			// An abort landing while the lookup is pending must surface as the shared abort
+			// contract, not as an authentication failure.
+			// Stryker disable next-line ConditionalExpression: the false mutant needs an abort inside a microtask window no test can schedule; the non-abort-failure regression kills the true mutant
+			if (isRequestAborted(error, abortSignal)) {
+				throw createAbortError(this.providerName)
+			}
+			throw error
+		}
 		if (!accessToken) {
 			throw new Error(
 				t("common:errors.openAiCodex.notAuthenticated", {
@@ -259,10 +305,9 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		const baseRequestBody = this.buildRequestBody(model, formattedInput, systemPrompt, reasoningEffort, metadata)
 		let requestBody: any
 		try {
-			requestBody =
-				model.id === LUNA_MODEL_ID
-					? this.buildLunaRequestBody(baseRequestBody, effectiveSessionId)
-					: baseRequestBody
+			requestBody = RESPONSES_LITE_MODEL_IDS.has(model.id)
+				? this.buildResponsesLiteRequestBody(baseRequestBody, effectiveSessionId)
+				: baseRequestBody
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
 			TelemetryService.instance.captureException(
@@ -274,15 +319,32 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		// Make the request with retry on auth failure
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
-				yield* this.executeRequest(requestBody, model, accessToken, effectiveSessionId)
+				yield* this.executeRequest(requestBody, model, accessToken, effectiveSessionId, abortSignal)
 				return
 			} catch (error) {
+				// The caller's cancellation wins over the retry: force-refreshing a token for a
+				// request that is already gone would spend a network round trip on a dead request
+				// and surface the cancellation as an authentication failure.
+				if (abortSignal?.aborted) {
+					throw createAbortError(this.providerName)
+				}
+
 				const message = error instanceof Error ? error.message : String(error)
 				const isAuthFailure = /unauthorized|invalid token|not authenticated|authentication|401/i.test(message)
 
-				if (attempt === 0 && isAuthFailure) {
-					// Force refresh the token for retry
-					const refreshed = await openAiCodexOAuthManager.forceRefreshAccessToken()
+				// Retrying is only safe while nothing has come back yet. Once the SDK has emitted,
+				// the service has accepted the request, so a refreshed-token retry would replay it
+				// and append a second generation to output the caller already has.
+				if (attempt === 0 && isAuthFailure && !this.sawSdkEventInCurrentResponse) {
+					// Force refresh the token for retry. Race the refresh against the caller's
+					// signal: an abort landing while the OAuth operation is pending must settle
+					// the request with the shared abort contract instead of leaving createMessage
+					// suspended until the refresh settles and then surfacing the authentication
+					// failure of a request that no longer exists.
+					const refreshPromise = openAiCodexOAuthManager.forceRefreshAccessToken()
+					const refreshed = abortSignal
+						? await rejectOnAbort(refreshPromise, abortSignal, this.providerName)
+						: await refreshPromise
 					if (!refreshed) {
 						throw new Error(
 							t("common:errors.openAiCodex.notAuthenticated", {
@@ -299,8 +361,8 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		}
 	}
 
-	private buildLunaRequestBody(baseRequestBody: any, effectiveSessionId: string): any {
-		return transformLunaResponsesLiteBody(baseRequestBody, effectiveSessionId)
+	private buildResponsesLiteRequestBody(baseRequestBody: any, effectiveSessionId: string): any {
+		return transformResponsesLiteBody(baseRequestBody, effectiveSessionId)
 	}
 
 	private buildRequestBody(
@@ -390,6 +452,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 			}>
 			tool_choice?: any
 			parallel_tool_calls?: boolean
+			text?: { verbosity: VerbosityLevel }
 		}
 
 		// Per the implementation guide: Codex backend may reject max_output_tokens
@@ -430,6 +493,11 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 			parallel_tool_calls: metadata?.parallelToolCalls ?? true,
 		}
 
+		// Include text.verbosity only when the model explicitly supports it
+		if (model.info.supportsVerbosity === true) {
+			body.text = { verbosity: model.verbosity || "medium" }
+		}
+
 		return body
 	}
 
@@ -438,16 +506,38 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		model: OpenAiCodexModel,
 		accessToken: string,
 		effectiveSessionId: string,
+		abortSignal?: AbortSignal,
 	): ApiStream {
-		// Create AbortController for cancellation
-		this.abortController = new AbortController()
+		// Request-local controller: a stale abort arriving after this request finishes must never
+		// reach the controller of a later request, so the bridge listener captures this controller
+		// directly.
+		const abortController = new AbortController()
+
+		// A caller's signal has to be linked rather than used directly, since both transports below
+		// abort through the request controller. Without this the signal never reaches the wire.
+		const abortFromCaller = () => abortController.abort()
+
+		if (abortSignal) {
+			if (abortSignal.aborted) {
+				abortController.abort()
+			} else {
+				abortSignal.addEventListener("abort", abortFromCaller, { once: true })
+			}
+		}
 
 		try {
 			// Prefer OpenAI SDK streaming (same approach as openai-native) so event handling
 			// is consistent across providers.
 			try {
 				// Get ChatGPT account ID for organization subscriptions
-				const accountId = await openAiCodexOAuthManager.getAccountId()
+				// The account lookup has the same gap as the token fetch: the request-local
+				// controller is already bridged to the caller's signal, so racing against it
+				// settles a cancelled request immediately instead of waiting on a dead lookup.
+				const accountId = await rejectOnAbort(
+					openAiCodexOAuthManager.getAccountId(),
+					abortController.signal,
+					this.providerName,
+				)
 
 				// Build Codex-specific headers. Authorization is provided by the SDK apiKey.
 				const codexHeaders = this.buildCodexHeaders(model, effectiveSessionId, accountId)
@@ -463,7 +553,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 					})
 
 				const stream = (await (client as any).responses.create(requestBody, {
-					signal: this.abortController.signal,
+					signal: abortController.signal,
 					// If the SDK supports per-request overrides, ensure headers are present.
 					headers: codexHeaders,
 				})) as AsyncIterable<any>
@@ -475,27 +565,53 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				}
 
 				for await (const event of stream) {
-					if (this.abortController.signal.aborted) {
+					if (abortController.signal.aborted) {
 						break
 					}
 
+					// Set before the event is processed, not after: `processEvent` also mutates
+					// response state, so a throw from it must not replay either.
+					this.sawSdkEventInCurrentResponse = true
+
 					for await (const outChunk of this.processEvent(event, model)) {
+						// The top-of-loop check covers the wire; this one covers the buffered chunks
+						// processEvent still emits for an event whose processing raced the abort. A break would let
+						// the event loop pull the stream once more before its top check sees the abort, so hand
+						// back the abort contract immediately instead.
+						if (abortController.signal.aborted) throw createAbortError(this.providerName)
 						if (outChunk.type === "text") {
 							this.sawTextOutputInCurrentResponse = true
 						}
 						yield outChunk
 					}
 				}
-			} catch (_sdkErr) {
+			} catch (sdkErr) {
+				// The fallback is only for an SDK that could not be used at all. Once the stream has
+				// emitted, the request has been accepted and its output is already with the caller,
+				// so replaying it over SSE would append a second generation to the first.
+				//
+				// A cancellation is not a transport failure either. Falling back would spend a
+				// second request on an already-aborted signal and report the cancellation as a
+				// connection error.
+				if (this.sawSdkEventInCurrentResponse || abortController.signal.aborted) {
+					throw sdkErr
+				}
+
 				// Fallback to manual SSE via fetch (Codex backend).
-				yield* this.makeCodexRequest(requestBody, model, accessToken, effectiveSessionId)
+				yield* this.makeCodexRequest(
+					requestBody,
+					model,
+					accessToken,
+					effectiveSessionId,
+					abortController.signal,
+				)
 			}
 		} finally {
-			this.abortController = undefined
+			abortSignal?.removeEventListener("abort", abortFromCaller)
 		}
 	}
 
-	private formatFullConversation(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): any {
+	private formatFullConversation(_systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): any {
 		const formattedInput: any[] = []
 
 		for (const message of messages) {
@@ -516,7 +632,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 						if (block.type === "text") {
 							content.push({ type: "input_text", text: block.text })
 						} else if (block.type === "image") {
-							const image = block as Anthropic.Messages.ImageBlockParam
+							const image = block
 							if (image.source.type === "base64") {
 								const imageUrl = `data:${image.source.media_type};base64,${image.source.data}`
 								content.push({ type: "input_image", image_url: imageUrl })
@@ -583,12 +699,15 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		model: OpenAiCodexModel,
 		accessToken: string,
 		effectiveSessionId: string,
+		abortSignal: AbortSignal,
 	): ApiStream {
 		// Per the implementation guide: route to Codex backend with Bearer token
 		const url = `${CODEX_API_BASE_URL}/responses`
 
 		// Get ChatGPT account ID for organization subscriptions
-		const accountId = await openAiCodexOAuthManager.getAccountId()
+		// The signal here is the request-local controller the caller's abort is bridged into, so a
+		// cancellation lands in the lookup and settles it before the fallback fetch would start.
+		const accountId = await rejectOnAbort(openAiCodexOAuthManager.getAccountId(), abortSignal, this.providerName)
 
 		// Build headers with required Codex-specific fields
 		const headers: Record<string, string> = {
@@ -602,7 +721,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				method: "POST",
 				headers,
 				body: JSON.stringify(requestBody),
-				signal: this.abortController?.signal,
+				signal: abortSignal,
 			})
 
 			if (!response.ok) {
@@ -662,8 +781,15 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				throw new Error(t("common:errors.openAiCodex.noResponseBody"))
 			}
 
-			yield* this.handleStreamResponse(response.body, model)
+			yield* this.handleStreamResponse(response.body, model, abortSignal)
 		} catch (error) {
+			// The caller cancelled, so this is not a transport fault: hand back the shared abort
+			// contract instead of reporting the caller's own cancellation to telemetry or wrapping it
+			// as a connection failure.
+			if (abortSignal.aborted) {
+				throw createAbortError(this.providerName)
+			}
+
 			const errorMessage = error instanceof Error ? error.message : String(error)
 			const apiError = new ApiProviderError(errorMessage, this.providerName, model.id, "createMessage")
 			TelemetryService.instance.captureException(apiError)
@@ -678,7 +804,11 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		}
 	}
 
-	private async *handleStreamResponse(body: ReadableStream<Uint8Array>, model: OpenAiCodexModel): ApiStream {
+	private async *handleStreamResponse(
+		body: ReadableStream<Uint8Array>,
+		model: OpenAiCodexModel,
+		abortSignal: AbortSignal,
+	): ApiStream {
 		const reader = body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ""
@@ -686,7 +816,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 
 		try {
 			while (true) {
-				if (this.abortController?.signal.aborted) {
+				if (abortSignal.aborted) {
 					break
 				}
 
@@ -745,6 +875,9 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 								}
 
 								for await (const outChunk of this.processEvent(parsed, model)) {
+									// A cancellation landing while processEvent is still emitting must not stream the
+									// event's remaining buffered chunks, so hand back the abort contract immediately.
+									if (abortSignal.aborted) throw createAbortError(this.providerName)
 									if (outChunk.type === "text" || outChunk.type === "reasoning") {
 										hasContent = true
 										if (outChunk.type === "text") {
@@ -764,6 +897,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 											if (content.type === "text" && content.text) {
 												hasContent = true
 												this.sawTextOutputInCurrentResponse = true
+												if (abortSignal.aborted) break
 												yield { type: "text", text: content.text }
 											}
 										}
@@ -772,6 +906,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 										for (const summary of outputItem.summary) {
 											if (summary?.type === "summary_text" && typeof summary.text === "string") {
 												hasContent = true
+												if (abortSignal.aborted) break
 												yield { type: "reasoning", text: summary.text }
 											}
 										}
@@ -780,6 +915,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 								if (parsed.response.usage) {
 									const usageData = this.normalizeUsage(parsed.response.usage, model)
 									if (usageData) {
+										if (abortSignal.aborted) break
 										yield usageData
 									}
 								}
@@ -829,7 +965,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 								if (parsed.delta) {
 									hasContent = true
 									this.sawTextOutputInCurrentResponse = true
-									yield { type: "text", text: `[Refusal] ${parsed.delta}` }
+									yield { type: "text", text: `${REFUSAL_TEXT_PREFIX}${parsed.delta}` }
 								}
 							} else if (parsed.type === "response.output_item.added") {
 								if (parsed.item) {
@@ -906,6 +1042,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 							} else if (parsed.choices?.[0]?.delta?.content) {
 								hasContent = true
 								this.sawTextOutputInCurrentResponse = true
+								if (abortSignal.aborted) break
 								yield { type: "text", text: parsed.choices[0].delta.content }
 							} else if (
 								parsed.item &&
@@ -914,10 +1051,12 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 							) {
 								hasContent = true
 								this.sawTextOutputInCurrentResponse = true
+								if (abortSignal.aborted) break
 								yield { type: "text", text: parsed.item.text }
 							} else if (parsed.usage) {
 								const usageData = this.normalizeUsage(parsed.usage, model)
 								if (usageData) {
+									if (abortSignal.aborted) break
 									yield usageData
 								}
 							}
@@ -932,6 +1071,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 							if (parsed.content || parsed.text || parsed.message) {
 								hasContent = true
 								this.sawTextOutputInCurrentResponse = true
+								if (abortSignal.aborted) break
 								yield { type: "text", text: parsed.content || parsed.text || parsed.message }
 							}
 						} catch {
@@ -941,6 +1081,13 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				}
 			}
 		} catch (error) {
+			// The caller cancelled while the fallback stream was being read: that is not a
+			// stream-processing failure, so hand back the shared abort contract instead of reporting
+			// the caller's own cancellation to telemetry.
+			if (abortSignal.aborted) {
+				throw createAbortError(this.providerName)
+			}
+
 			const errorMessage = error instanceof Error ? error.message : String(error)
 			const apiError = new ApiProviderError(errorMessage, this.providerName, model.id, "createMessage")
 			TelemetryService.instance.captureException(apiError)
@@ -1021,7 +1168,7 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		if (event?.type === "response.refusal.delta") {
 			if (event?.delta) {
 				this.sawTextOutputInCurrentResponse = true
-				yield { type: "text", text: `[Refusal] ${event.delta}` }
+				yield { type: "text", text: `${REFUSAL_TEXT_PREFIX}${event.delta}` }
 			}
 			return
 		}
@@ -1194,8 +1341,21 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 	}
 
 	private getReasoningEffort(model: OpenAiCodexModel): ReasoningEffortExtended | undefined {
-		const selected = (this.options.reasoningEffort as any) ?? (model.info.reasoningEffort as any)
-		return selected && selected !== "disable" && selected !== "none" ? (selected as any) : undefined
+		const supported = model.info.supportsReasoningEffort
+		const configured = this.options.reasoningEffort
+		const fallback = model.info.reasoningEffort
+		const reasoningDisabled =
+			configured === "disable" || configured === "none" || this.options.enableReasoningEffort === false
+
+		if (reasoningDisabled && !model.info.requiredReasoningEffort) return undefined
+
+		if (Array.isArray(supported)) {
+			if (!reasoningDisabled && configured && supported.includes(configured)) return configured
+			return fallback && fallback !== "none" && supported.includes(fallback) ? fallback : undefined
+		}
+
+		const selected = configured === "disable" ? fallback : (configured ?? fallback)
+		return selected && selected !== "none" ? selected : undefined
 	}
 
 	private buildCodexHeaders(
@@ -1203,17 +1363,22 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		effectiveSessionId: string,
 		accountId?: string | null,
 	): Record<string, string> {
+		const usesResponsesLite = RESPONSES_LITE_MODEL_IDS.has(model.id)
 		return {
 			originator: "zoo-code",
 			session_id: effectiveSessionId,
 			"User-Agent": `zoo-code/${Package.version} (${os.platform()} ${os.release()}; ${os.arch()}) node/${process.version.slice(1)}`,
 			...(accountId ? { "ChatGPT-Account-Id": accountId } : {}),
-			...(model.id === LUNA_MODEL_ID
+			...(usesResponsesLite
 				? {
 						"session-id": effectiveSessionId,
+						"x-openai-internal-codex-responses-lite": "true",
+					}
+				: {}),
+			...(model.id === LUNA_MODEL_ID
+				? {
 						"x-session-affinity": effectiveSessionId,
 						version: LUNA_CODEX_VERSION,
-						"x-openai-internal-codex-responses-lite": "true",
 					}
 				: {}),
 		}
@@ -1256,99 +1421,76 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 		return this.lastResponseId
 	}
 
+	/**
+	 * The Codex subscription endpoint only accepts streaming requests - a body with `stream: false`
+	 * is rejected with `Stream must be set to true` - so a one-shot completion is the streaming
+	 * request with its text chunks joined back together.
+	 *
+	 * Going through `handleResponsesApiMessage` rather than issuing its own request is what keeps
+	 * the OAuth refresh-and-retry, the SDK-then-SSE fallback, the Luna body and the service tier
+	 * from having to be duplicated here.
+	 */
 	async completePrompt(prompt: string, options?: CompletePromptOptions): Promise<string> {
-		this.abortController = new AbortController()
+		// Fast-fail if the caller's stop signal already fired before we started: a cancelled
+		// request must not spend the OAuth setup (token and account fetch) or an SDK request on
+		// a completion that is already gone.
+		throwIfAborted(options?.abortSignal)
+
+		// Merge an optional timeout into the caller's abort signal so a timeout cancels the
+		// completion the same way an external abort does (timeoutMs <= 0 disables it).
+		const requestSignal = mergeAbortSignalAndTimeout(options?.abortSignal, options?.timeoutMs)
 
 		try {
 			const model = this.getModel()
 
-			// Get access token
-			const accessToken = await openAiCodexOAuthManager.getAccessToken()
-			if (!accessToken) {
-				throw new Error(
-					t("common:errors.openAiCodex.notAuthenticated", {
-						defaultValue:
-							"Not authenticated with OpenAI Codex. Please sign in using the OpenAI Codex OAuth flow.",
-					}),
-				)
-			}
+			// Only the answer is wanted. Reasoning is deliberately dropped rather than concatenated:
+			// the prompt enhancer writes this straight into the input box.
+			let text = ""
 
-			const reasoningEffort = this.getReasoningEffort(model)
-			const serviceTier = getOpenAiCodexServiceTier(this.options)
+			const stream = this.handleResponsesApiMessage(
+				model,
+				"",
+				[{ role: "user", content: prompt }],
+				// `taskId` is required, and resolves to the same session id this used to send
+				// directly, so `prompt_cache_key` is unchanged.
+				{ taskId: this.sessionId },
+				requestSignal,
+			)
 
-			const baseRequestBody: any = {
-				model: model.id,
-				input: [
-					{
-						role: "user",
-						content: [{ type: "input_text", text: prompt }],
-					},
-				],
-				stream: false,
-				store: false,
-				...(serviceTier ? { [SERVICE_TIER_KEY]: serviceTier } : {}),
-				...(reasoningEffort ? { include: ["reasoning.encrypted_content"] } : {}),
-			}
+			for await (const chunk of stream) {
+				// A buffered chunk can still be pulled in the window between the abort and the
+				// inner generator's own stop, so break here: post-abort output must never be
+				// joined into the completion.
+				// Stryker disable next-line ConditionalExpression: the false mutant needs an abort inside the yield-hop microtask window no test can schedule; the multi-chunk happy paths kill the true mutant
+				if (requestSignal?.aborted) {
+					break
+				}
 
-			if (reasoningEffort) {
-				baseRequestBody.reasoning = {
-					effort: reasoningEffort,
-					summary: "auto" as const,
+				// Refusals are streamed as text for the chat, but they are not output: the
+				// non-streaming request this replaced read `output_text`, which never carries them.
+				// Keeping them would paste "[Refusal] ..." into the input box as if it were an answer.
+				if (chunk.type === "text" && !chunk.text.startsWith(REFUSAL_TEXT_PREFIX)) {
+					text += chunk.text
 				}
 			}
 
-			const requestBody =
-				model.id === LUNA_MODEL_ID
-					? this.buildLunaRequestBody(baseRequestBody, this.sessionId)
-					: baseRequestBody
-
-			const url = `${CODEX_API_BASE_URL}/responses`
-
-			// Get ChatGPT account ID for organization subscriptions
-			const accountId = await openAiCodexOAuthManager.getAccountId()
-
-			// Build headers with required Codex-specific fields
-			const headers: Record<string, string> = {
-				...this.buildCodexHeaders(model, this.sessionId, accountId),
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${accessToken}`,
+			// Both transports end quietly on abort - they break out of their loops rather than
+			// throwing - so returning here would report a cancelled generation as a finished one and
+			// hand the caller whatever partial text had arrived.
+			if (requestSignal?.aborted) {
+				throw createAbortError(this.providerName)
 			}
 
-			const response = await fetch(url, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(requestBody),
-				signal: this.abortController.signal,
-			})
-
-			if (!response.ok) {
-				const errorText = await response.text()
-				throw new Error(
-					t("common:errors.openAiCodex.genericError", { status: response.status }) +
-						(errorText ? `: ${errorText}` : ""),
-				)
-			}
-
-			const responseData = await response.json()
-
-			if (responseData?.output && Array.isArray(responseData.output)) {
-				for (const outputItem of responseData.output) {
-					if (outputItem.type === "message" && outputItem.content) {
-						for (const content of outputItem.content) {
-							if (content.type === "output_text" && content.text) {
-								return content.text
-							}
-						}
-					}
-				}
-			}
-
-			if (responseData?.text) {
-				return responseData.text
-			}
-
-			return ""
+			return text
 		} catch (error) {
+			// Cancelling is the caller's own doing, not a provider failure, so it is neither
+			// reported to telemetry nor relabelled as a completion error: a timed-out or
+			// cancelled request is normalized to the shared abort contract whether the stream
+			// ended quietly or the request threw.
+			if (isRequestAborted(error, requestSignal)) {
+				throw createAbortError(this.providerName)
+			}
+
 			const errorModel = this.getModel()
 			const errorMessage = error instanceof Error ? error.message : String(error)
 			const apiError = new ApiProviderError(errorMessage, this.providerName, errorModel.id, "completePrompt")
@@ -1358,8 +1500,6 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				throw new Error(t("common:errors.openAiCodex.completionError", { message: error.message }))
 			}
 			throw error
-		} finally {
-			this.abortController = undefined
 		}
 	}
 }
